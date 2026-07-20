@@ -1,0 +1,170 @@
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+# This workflow will build a package using Gradle and then publish it to GitHub packages when a release is created
+# For more information see: https://github.com/actions/setup-java/blob/main/docs/advanced-usage.md#Publishing-using-gradle
+
+name: Gradle Package
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write# xYuan's Mod CI / Release
+#
+# 本工作流负责：
+#   1. 在 push / PR 时校验项目可编译，并把构建产物上传为 workflow artifact
+#   2. 在创建 Release（或推送 v* tag）时，把 jar 附加到 GitHub Release
+#
+# 关键点：
+#   - JDK 21（项目硬性要求 Java 21；Fabric Loom 与 yarn 映射均依赖此版本）
+#   - 仓库未内置 gradlew 脚本，CI 中先用全局 gradle 生成 wrapper，再执行 build
+#   - build.gradle.kts 中未配置 maven-publish 插件，因此不使用 `./gradlew publish`，
+#     改用 softprops/action-gh-release 把 jar 直接附加到 Release 资源
+
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  release:
+    types: [created]
+
+# 同一分支 / tag 的新推送取消正在进行的旧运行，节省 CI 资源
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['21']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # 启用 Gradle 依赖与配置缓存，加速后续构建
+          cache-disabled: false
+
+      - name: Generate Gradle Wrapper
+        # 项目仅包含 gradle-wrapper.properties，未内置 gradlew 脚本。
+        # CI 中先用全局 gradle 生成 wrapper，之后即可使用 ./gradlew。
+        run: gradle wrapper --gradle-version 9.2.0 --distribution-type bin
+
+      - name: Build with Gradle
+        run: ./gradlew build --no-daemon --stacktrace
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xYuan-s-Mod-jdk${{ matrix.java }}
+          path: build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    # 仅在创建 Release 或推送 v* tag 时运行
+    name: Attach JAR to Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Generate Gradle Wrapper
+        run: gradle wrapper --gradle-version 9.2.0 --distribution-type bin
+
+      - name: Build release JAR
+        run: ./gradlew build --no-daemon --stacktrace
+
+      - name: Resolve JAR path
+        id: jar
+        run: |
+          # archives_base_name = "xYuan's Mod"，版本来自 gradle/libs.versions.toml 的 mod.version
+          # 取出 build/libs 下的主 jar（不含 -sources / -dev）
+          jar_path=$(find build/libs -maxdepth 1 -type f -name "*.jar" ! -name "*-sources.jar" ! -name "*-dev.jar" | head -n 1)
+          if [ -z "$jar_path" ]; then
+            echo "::error::No release JAR found in build/libs"
+            exit 1
+          fi
+          echo "path=$jar_path" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$jar_path")" >> "$GITHUB_OUTPUT"
+
+      - name: Attach JAR to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.jar.outputs.path }}
+          name: ${{ steps.jar.outputs.name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        server-id: github # Value of the distributionManagement/repository/id field of the pom.xml
+        settings-path: ${{ github.workspace }} # location for the settings.xml file
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+
+    - name: Build with Gradle
+      run: ./gradlew build
+
+    # The USERNAME and TOKEN need to correspond to the credentials environment variables used in
+    # the publishing section of your build.gradle
+    - name: Publish to GitHub Packages
+      run: ./gradlew publish
+      env:
+        USERNAME: ${{ github.actor }}
+        TOKEN: ${{ secrets.GITHUB_TOKEN }}
