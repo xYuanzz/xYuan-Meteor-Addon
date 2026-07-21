@@ -9,43 +9,22 @@ import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.damage.DamageType;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.network.packet.s2c.play.DeathMessageS2CPacket;
+import net.minecraft.network.packet.s2c.play.EntityDamageS2CPacket;
 import net.minecraft.network.packet.s2c.play.EntityStatusS2CPacket;
+import net.minecraft.registry.entry.RegistryEntry;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
 /**
- * Meteor 附属模块：监控本地玩家不死图腾触发与玩家死亡，并通过飞书自定义机器人 Webhook
- * 推送提醒（图腾触发附带背包剩余图腾数量；死亡携带游戏返回的死亡信息）。
+ * 图腾提醒模块：监控本地玩家不死图腾触发与玩家死亡，通过飞书 Webhook 推送提醒。
  *
- * <h2>图腾检测原理</h2>
- * <p>当玩家触发不死图腾时，服务端会向所有可见客户端广播一条
- * {@link EntityStatusS2CPacket}，状态码为 {@value #TOTEM_STATUS}。本模块通过
- * Meteor 的 {@link PacketEvent.Receive} 零 Mixin 拦截该数据包，并校验目标实体
- * 是否为本地玩家，避免其他玩家触发图腾时误报。</p>
- *
- * <h2>死亡检测原理</h2>
- * <p>当本地玩家死亡时，服务端会发送一条 {@link DeathMessageS2CPacket}（用于触发
- * 死亡界面），其中 {@code message()} 即为游戏返回的死亡信息（如「被xxx杀死了」）。
- * 本模块拦截该数据包，校验 {@code playerId} 为本地玩家后推送死亡提醒。</p>
- *
- *
- * <h2>剩余图腾统计</h2>
- * <p>触发时遍历 {@link net.minecraft.entity.player.PlayerInventory} 全部格子
- * （主背包 + 快捷栏 + 副手），累计 {@link Items#TOTEM_OF_UNDYING} 堆叠数量。</p>
- *
- * <h2>同步延迟处理</h2>
- * <p>服务端在触发图腾时会立即消耗一个图腾并广播 {@link EntityStatusS2CPacket}，
- * 但客户端的背包同步包（{@code ScreenHandlerSlotUpdateS2CPacket}）可能稍后到达。
- * 若直接读取背包，被消耗的图腾可能仍显示在副手/主手中，导致计数偏多 1、紧急提醒
- * （剩余 0）无法触发。本模块按 vanilla 检查顺序（副手优先 → 主手）扣除被消耗的
- * 那一个图腾，确保计数正确。</p>
- *
- * <p>所有 Webhook 请求在独立守护线程异步执行，不阻塞主线程。
- * 仅客户端生效，无任何服务端逻辑。</p>
+ * <p>图腾触发附带伤害来源（类型 ID + 来源实体名）与背包剩余图腾数量；
+ * 死亡携带游戏返回的死亡信息。不做防重复去抖，避免漏掉关键信息。</p>
  */
 public class TotemNoticeModule extends Module {
 
@@ -55,12 +34,12 @@ public class TotemNoticeModule extends Module {
     /** 实体状态码 35 = 不死图腾触发（vanilla 协议约定）。 */
     private static final byte TOTEM_STATUS = 35;
 
+    /** 伤害缓存有效期（毫秒）：图腾触发时仅读取此窗口内的伤害，避免误用旧伤害。 */
+    private static final long DAMAGE_WINDOW_MS = 500;
+
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgAdvanced = settings.createGroup("高级");
 
-    // ---------- 基础设置 ----------
-
-    /** 剩余图腾数为 0 时使用紧急提醒样式（整行加粗红色 + 「图腾已耗尽-」前缀）。 */
     private final Setting<Boolean> urgentWhenEmpty = sgGeneral.add(new BoolSetting.Builder()
             .name("耗尽时紧急提醒")
             .description("剩余图腾为 0 时整行加粗红色并追加「图腾已耗尽-」前缀，便于快速补图腾。")
@@ -68,7 +47,6 @@ public class TotemNoticeModule extends Module {
             .build()
     );
 
-    /** 玩家死亡时推送死亡提醒（携带游戏返回的死亡信息）。 */
     private final Setting<Boolean> enableDeathNotify = sgGeneral.add(new BoolSetting.Builder()
             .name("启用死亡提醒")
             .description("玩家死亡时推送提醒，携带游戏返回的死亡信息（如「被xxx杀死了」）。")
@@ -76,9 +54,6 @@ public class TotemNoticeModule extends Module {
             .build()
     );
 
-    // ---------- 高级设置 ----------
-
-    /** 跳过 3c3u.org 白名单校验，允许在任意服务器触发图腾提醒。 */
     private final Setting<Boolean> skipServerCheck = sgAdvanced.add(new BoolSetting.Builder()
             .name("不校验服务器地址")
             .description("跳过 3c3u.org 白名单校验，允许在任意服务器触发图腾提醒。")
@@ -88,8 +63,12 @@ public class TotemNoticeModule extends Module {
 
     // ---------- 运行时状态 ----------
 
-    /** 缓存的玩家名（在游戏中捕获，用于通知中区分账号）。 */
     private String playerName;
+
+    /** 缓存最近一次本地玩家受到的伤害（供图腾触发时读取伤害来源）。 */
+    private RegistryEntry<DamageType> lastDamageType;
+    private int lastDamageCauseId = -1;
+    private long lastDamageTimeMs;
 
     public TotemNoticeModule() {
         super(QueueNoticeAddon.CATEGORY, "图腾提醒", "监控不死图腾触发与玩家死亡并通过飞书 Webhook 推送提醒，附带剩余图腾数量与死亡信息。");
@@ -98,31 +77,29 @@ public class TotemNoticeModule extends Module {
     @Override
     public void onActivate() {
         playerName = null;
+        lastDamageType = null;
+        lastDamageCauseId = -1;
+        lastDamageTimeMs = 0;
         capturePlayerName();
     }
 
-    @Override
-    public void onDeactivate() {
-        // 图腾模块无持久状态需要清理
-    }
-
-    // ---------- 事件监听 ----------
-
     /**
-     * 拦截数据包：图腾触发（{@link EntityStatusS2CPacket} 状态码 35）与玩家死亡
-     * （{@link DeathMessageS2CPacket}）。
+     * 拦截数据包：死亡（DeathMessageS2CPacket）、伤害（EntityDamageS2CPacket）、
+     * 图腾触发（EntityStatusS2CPacket 状态码 35）。
      *
-     * <p>注意：{@link EntityStatusS2CPacket#getEntity(net.minecraft.world.World)} 需要
-     * 在客户端世界中查询实体；若 {@code mc.world} 为 null（退出服务器瞬间）则跳过图腾处理。</p>
-     *
-     * <p>死亡数据包仅在本地玩家死亡时由服务端发送（用于触发死亡界面），其中
-     * {@code message()} 即为游戏返回的死亡信息（如「被xxx杀死了」）。</p>
+     * <p>vanilla 受伤流程中伤害包先于图腾包到达，本模块缓存最近一次伤害供图腾触发时读取。</p>
      */
     @EventHandler
     private void onPacketReceive(PacketEvent.Receive event) {
         // 玩家死亡：优先处理（独立于图腾触发）
         if (event.packet instanceof DeathMessageS2CPacket deathPacket) {
             handleDeathMessage(deathPacket);
+            return;
+        }
+
+        // 伤害包：缓存最近一次本地玩家受到的伤害
+        if (event.packet instanceof EntityDamageS2CPacket dmgPacket) {
+            cacheDamageIfLocalPlayer(dmgPacket);
             return;
         }
 
@@ -141,31 +118,31 @@ public class TotemNoticeModule extends Module {
         if (entity != mc.player) {
             return;
         }
-
-        // 服务器门控
         if (!isOnTargetServer()) {
             return;
         }
 
-        // 统计剩余图腾并发送通知（不做防重复去抖，避免漏掉关键信息）
         capturePlayerName();
         int remaining = countTotemsAfterConsumption();
-        sendTotemReminder(remaining);
+        String damageDesc = buildDamageDescription();
+        sendTotemReminder(remaining, damageDesc);
     }
 
-    /**
-     * 处理玩家死亡数据包：仅处理本地玩家的死亡，推送携带死亡信息的提醒。
-     *
-     * <p>同样受 {@link #isOnTargetServer()} 服务器门控约束，与图腾触发一致。</p>
-     */
+    /** 缓存针对本地玩家的伤害：记录伤害类型、来源实体 ID 与时间戳。 */
+    private void cacheDamageIfLocalPlayer(EntityDamageS2CPacket packet) {
+        if (mc.player == null || packet.entityId() != mc.player.getId()) {
+            return;
+        }
+        lastDamageType = packet.sourceType();
+        lastDamageCauseId = packet.sourceCauseId();
+        lastDamageTimeMs = System.currentTimeMillis();
+    }
+
+    /** 处理玩家死亡数据包：仅处理本地玩家的死亡，推送携带死亡信息的提醒。 */
     private void handleDeathMessage(DeathMessageS2CPacket packet) {
-        if (!enableDeathNotify.get()) {
+        if (!enableDeathNotify.get() || mc.player == null) {
             return;
         }
-        if (mc.player == null) {
-            return;
-        }
-        // 仅处理本地玩家的死亡（packet.playerId 为死亡玩家的实体 ID）
         if (packet.playerId() != mc.player.getId()) {
             return;
         }
@@ -173,21 +150,15 @@ public class TotemNoticeModule extends Module {
             return;
         }
         capturePlayerName();
-        String deathMessage = packet.message().getString();
-        sendDeathReminder(deathMessage);
+        sendDeathReminder(packet.message().getString());
     }
-
-    // ---------- 核心逻辑 ----------
 
     /**
      * 统计触发图腾后背包剩余的不死图腾数量。
      *
-     * <p>遍历玩家全部背包格子（{@link net.minecraft.entity.player.PlayerInventory#size()}
-     * 已包含主背包 + 快捷栏 + 护甲 + 副手。</p>
-     *
-     * <p>由于服务端消耗图腾与客户端背包同步之间存在网络延迟，触发时被消耗的图腾
-     * 可能仍显示在副手/主手中。按 vanilla 检查顺序（副手优先 → 主手）扣除被消耗的
-     * 那一个图腾，确保计数正确，紧急提醒（剩余 0）能正常触发。</p>
+     * <p>PlayerInventory.size() 已包含主背包 + 快捷栏 + 护甲 + 副手。
+     * 由于服务端消耗图腾与客户端背包同步之间存在网络延迟，按 vanilla 检查顺序
+     * （副手优先 → 主手）扣除被消耗的那一个图腾，确保计数正确。</p>
      */
     private int countTotemsAfterConsumption() {
         if (mc.player == null) {
@@ -195,7 +166,6 @@ public class TotemNoticeModule extends Module {
         }
 
         int count = 0;
-        // 遍历全部背包格子（已包含主背包 + 快捷栏 + 护甲 + 副手）
         for (int i = 0; i < mc.player.getInventory().size(); i++) {
             ItemStack stack = mc.player.getInventory().getStack(i);
             if (stack.getItem() == Items.TOTEM_OF_UNDYING) {
@@ -217,39 +187,29 @@ public class TotemNoticeModule extends Module {
         return Math.max(0, count);
     }
 
-    /**
-     * 发送图腾触发提醒。
-     *
-     *
-     * <p>第二行追加「玩家:xxx」便于在同一 Webhook 下区分不同账号；
-     * 剩余图腾数为 0 时追加「图腾已耗尽-」前缀（与完成提醒的「排队已完成-」前缀风格一致，
-     * 可在设置中关闭）。</p>
-     */
-    private void sendTotemReminder(int remaining) {
-        String markdown = buildMarkdown(remaining);
+    /** 构造并发送图腾触发提醒。 */
+    private void sendTotemReminder(int remaining, String damageDescription) {
         FeishuWebhookModule webhook = Modules.get().get(FeishuWebhookModule.class);
         if (webhook != null) {
-            webhook.sendMarkdown(markdown);
+            webhook.sendMarkdown(buildMarkdown(remaining, damageDescription));
         }
     }
 
-    /** 构造图腾提醒 Markdown 内容。 */
-    private String buildMarkdown(int remaining) {
+    /** 构造图腾提醒 Markdown 内容。紧急提醒（剩余 0）时整行加粗红色并追加「图腾已耗尽-」前缀。 */
+    private String buildMarkdown(int remaining, String damageDescription) {
         capturePlayerName();
         String time = LocalDateTime.now().format(TIME_FORMAT);
         String player = (playerName == null || playerName.isEmpty()) ? "unknown" : playerName;
         boolean urgent = (remaining == 0) && urgentWhenEmpty.get();
 
         StringBuilder sb = new StringBuilder();
-        // 第一行：[警告]图腾已被触发 —— 飞书 markdown 加粗用 **text**，颜色用 <font color="...">
-        // 紧急提醒（剩余 0）时整行加粗红色，并追加「图腾已耗尽-」前缀以突出状态
         if (urgent) {
             sb.append("<font color=\"red\">**图腾已耗尽-[警告]图腾已被触发**</font>\n");
         } else {
             sb.append("<font color=\"red\">**[警告]图腾已被触发**</font>\n");
         }
         sb.append("玩家:").append(player).append("\n");
-        // 第二行：剩余图腾数量（数量为 0 时红色加粗，否则普通显示）
+        sb.append("触发伤害:").append(damageDescription).append("\n");
         if (remaining == 0) {
             sb.append("剩余图腾:").append("<font color=\"red\">**").append(remaining).append("**</font>\n");
         } else {
@@ -260,19 +220,51 @@ public class TotemNoticeModule extends Module {
     }
 
     /**
+     * 构造图腾触发的伤害来源描述。
      *
-     * <p>第一行为游戏返回的死亡信息（{@link DeathMessageS2CPacket#message()}），
-     * 以红色加粗显示；若死亡信息为空则回退为「已死亡」。</p>
+     * <p>格式：有来源实体时为「伤害类型ID(来源实体名)」；环境伤害仅显示类型 ID；
+     * 无缓存或已过期显示「未知伤害」。yarn 映射中 DamageType 的字段为 msgId。</p>
      */
+    private String buildDamageDescription() {
+        if (lastDamageType == null || lastDamageTimeMs == 0
+                || System.currentTimeMillis() - lastDamageTimeMs > DAMAGE_WINDOW_MS) {
+            return "未知伤害";
+        }
+
+        String typeId;
+        try {
+            typeId = lastDamageType.value().msgId();
+        } catch (Throwable ignored) {
+            typeId = "unknown";
+        }
+        if (typeId == null || typeId.isEmpty()) {
+            typeId = "unknown";
+        }
+
+        if (lastDamageCauseId == -1 || mc.world == null) {
+            return typeId;
+        }
+        try {
+            Entity cause = mc.world.getEntityById(lastDamageCauseId);
+            if (cause != null) {
+                String name = cause.getName().getString();
+                if (name != null && !name.isEmpty()) {
+                    return typeId + "(" + name + ")";
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return typeId;
+    }
+
+    /** 构造并发送玩家死亡提醒。第一行为游戏返回的死亡信息（红色加粗）。 */
     private void sendDeathReminder(String deathMessage) {
-        String markdown = buildDeathMarkdown(deathMessage);
         FeishuWebhookModule webhook = Modules.get().get(FeishuWebhookModule.class);
         if (webhook != null) {
-            webhook.sendMarkdown(markdown);
+            webhook.sendMarkdown(buildDeathMarkdown(deathMessage));
         }
     }
 
-    /** 死亡提醒 Markdown 内容。 */
     private String buildDeathMarkdown(String deathMessage) {
         capturePlayerName();
         String time = LocalDateTime.now().format(TIME_FORMAT);
@@ -280,31 +272,22 @@ public class TotemNoticeModule extends Module {
         String msg = (deathMessage == null || deathMessage.isEmpty()) ? "已死亡" : deathMessage;
 
         StringBuilder sb = new StringBuilder();
-        // 第一行：游戏返回的死亡信息（红色加粗）
         sb.append("<font color=\"red\">**").append(msg).append("**</font>\n");
         sb.append("玩家:").append(player).append("\n");
         sb.append("触发时间:").append(time);
         return sb.toString();
     }
 
-    // ---------- 工具方法 ----------
-
-    /** 在玩家存在时缓存玩家名。 */
     private void capturePlayerName() {
         if ((playerName == null || playerName.isEmpty()) && mc.player != null) {
             try {
                 playerName = mc.player.getName().getString();
             } catch (Throwable ignored) {
-                // 忽略，保持 null
             }
         }
     }
 
-    /**
-     * 判断当前是否在目标服务器。
-     *
-     * <p>启用「不校验服务器地址」时直接返回 true；否则按地址包含 {@code 3c3u.org} 判定。</p>
-     */
+    /** 启用「不校验服务器地址」时直接返回 true；否则按地址包含 3c3u.org 判定。 */
     private boolean isOnTargetServer() {
         if (skipServerCheck.get()) {
             return true;

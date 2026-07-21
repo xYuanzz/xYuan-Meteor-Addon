@@ -4,46 +4,31 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Encapsulates queue-text recognition.
+ * 队列文本识别工具。
  *
- * <p>Adapted from the regex approach used by
- * <a href="https://github.com/SnowZhouer/queue-notice-mod">queue-notice-mod</a>,
- * broadened to cover common Chinese and English queue-server message formats
- * (chat messages, titles, subtitles and the action bar).</p>
- *
- * <p>All matching is lightweight {@link Pattern} work, suitable for running on
- * every incoming chat/packet event without impacting performance.</p>
+ * <p>适配 3c3u.org 等排队服常见的中英文队列消息格式（聊天、标题、副标题、动作栏）。
+ * 匹配均为轻量 {@link Pattern} 工作，适合在每次数据包事件上执行。</p>
  */
 public final class QueueParser {
 
     private QueueParser() {
     }
 
-    /**
-     * Queue-position patterns. Capture group 1 is the numeric position.
-     * Ordered from most specific to most permissive; the first match wins.
-     */
+    /** 队列位置正则。捕获组 1 为数字位置，按从严格到宽松顺序匹配，首个命中即返回。 */
     private static final Pattern[] QUEUE_PATTERNS = {
-        // 你在队列中第 50 位
-        Pattern.compile("你在队列中第\\s*(\\d+)\\s*位"),
-        // 正在游玩 ... 队列位置：50
-        Pattern.compile("正在.*?队列位置[:：]\\s*(\\d+)"),
-        // 队列位置：50  /  队列位置: 50
-        Pattern.compile("队列位置[:：]\\s*(\\d+)"),
-        // 排队中第 50 位
-        Pattern.compile("排队.*?第\\s*(\\d+)\\s*位"),
-        // Position in queue: 50
-        Pattern.compile("Position in queue[:：]?\\s*(\\d+)", Pattern.CASE_INSENSITIVE),
-        // Queue position: 50  /  Queue ... position: 50
-        Pattern.compile("Queue[^\\d]*?position[:：]?\\s*(\\d+)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("你在队列中第\\s*(\\d+)\\s*位"),
+            Pattern.compile("正在.*?队列位置[:：]\\s*(\\d+)"),
+            Pattern.compile("队列位置[:：]\\s*(\\d+)"),
+            Pattern.compile("排队.*?第\\s*(\\d+)\\s*位"),
+            Pattern.compile("Position in queue[:：]?\\s*(\\d+)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("Queue[^\\d]*?position[:：]?\\s*(\\d+)", Pattern.CASE_INSENSITIVE),
     };
 
     /**
-     * Tries to extract a queue position from a piece of received text.
+     * 从文本中提取队列位置。
      *
-     * @param text the plain-text content of a chat message / title / action bar
-     * @return the parsed position ({@code >= 0}), or {@code -1} if no queue
-     *         information could be found
+     * @param text 聊天 / 标题 / 动作栏的纯文本内容
+     * @return 解析出的位置（{@code >= 0}），未找到返回 {@code -1}
      */
     public static int parsePosition(String text) {
         if (text == null || text.isEmpty()) {
@@ -59,7 +44,6 @@ public final class QueueParser {
                         return position;
                     }
                 } catch (NumberFormatException ignored) {
-                    // Should never happen because the group is \\d+, but guard anyway.
                 }
             }
         }

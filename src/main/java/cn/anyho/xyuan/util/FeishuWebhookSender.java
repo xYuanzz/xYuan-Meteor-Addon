@@ -16,37 +16,24 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 
 /**
- * Sends notifications to a Feishu (Lark) custom-bot webhook.
+ * 飞书自定义机器人 Webhook 发送器。
  *
- * <p>Implements the official custom-bot specification described at
- * <a href="https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot">the Feishu docs</a>:
- * <ul>
- *   <li>POST {@code application/json} to the webhook URL.</li>
- *   <li>Uses the <b>interactive card</b> message type ({@code msg_type: "interactive"})
- *       with a single Markdown element, so that Feishu Markdown syntax such as
- *       {@code <font color="red">**XXX**</font>} renders as red bold text.</li>
- *   <li>Optional signature verification: the string {@code timestamp + "\n" + secret}
- *       is used as the <b>HMAC key</b> to HmacSHA256-sign an <b>empty</b> byte
- *       array, then Base64-encoded; {@code timestamp} (seconds, as a string) and
- *       {@code sign} are added to the request body. The timestamp is valid for
- *       1 hour.</li>
- * </ul>
+ * <p>实现官方自定义机器人规范：POST application/json，使用交互式卡片（msg_type: "interactive"）
+ * + 单个 Markdown 元素承载结构化文本，使 {@code <font color="red">**XXX**</font>} 红色加粗生效。
+ * 可选签名校验：以 {@code timestamp + "\n" + secret} 作为 HmacSHA256 密钥对空字节数组签名，
+ * 再 Base64 编码，timestamp 为秒级字符串（1 小时有效）。</p>
  *
- * <p>All network I/O runs on a dedicated daemon thread so the Minecraft main
- * thread is never blocked. Failures are logged but never propagated to the
- * caller, so the game cannot crash because of a webhook problem.</p>
+ * <p>所有网络 I/O 在独立守护线程异步执行，不阻塞 Minecraft 主线程。
+ * 失败仅记录日志，不会向上抛出异常导致游戏崩溃。</p>
  */
 public final class FeishuWebhookSender {
 
-    /** Shared HTTP client (thread-safe by design). */
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(10))
-        .build();
+            .connectTimeout(Duration.ofSeconds(10))
+            .build();
 
-    /** Single-thread daemon executor: serialises sends which also helps with rate limiting. */
     private static final ExecutorService EXECUTOR = Executors.newSingleThreadExecutor(r -> {
         Thread thread = new Thread(r, "Feishu-Webhook-Sender");
         thread.setDaemon(true);
@@ -57,18 +44,14 @@ public final class FeishuWebhookSender {
     }
 
     /**
-     * Asynchronously sends an interactive-card message containing the given
-     * Markdown content to the given Feishu webhook.
+     * 异步发送交互式卡片消息。
      *
-     * <p>The {@code prefix} is prepended to the Markdown content so that Feishu
-     * keyword-safety verification can pass.</p>
-     *
-     * @param webhookUrl       full webhook URL (e.g. {@code https://open.feishu.cn/open-apis/bot/v2/hook/xxx})
-     * @param prefix           keyword-safety prefix prepended to the markdown (may be empty / null)
-     * @param markdownContent  the markdown body (multi-line, may include {@code <font color="red">**..**</font>})
-     * @param enableSign       whether to attach the HmacSHA256 signature
-     * @param secret           the bot signing secret (required when {@code enableSign} is true)
-     * @param logger           logger used for error reporting
+     * @param webhookUrl      完整 Webhook URL
+     * @param prefix          关键词安全校验前缀（可为空 / null）
+     * @param markdownContent Markdown 正文（多行，可含红色加粗样式）
+     * @param enableSign      是否附加 HmacSHA256 签名
+     * @param secret          签名密钥（enableSign 为 true 时必填）
+     * @param logger          日志记录器
      */
     public static void sendAsync(String webhookUrl, String prefix, String markdownContent,
                                  boolean enableSign, String secret, Logger logger) {
@@ -80,7 +63,6 @@ public final class FeishuWebhookSender {
             try {
                 sendSync(webhookUrl, prefix, markdownContent, enableSign, secret, logger);
             } catch (Throwable throwable) {
-                // Never let a webhook failure escape to the caller.
                 logger.error("[xYuan's Mod] Feishu webhook send failed: {}", throwable.toString());
             }
         });
@@ -90,7 +72,6 @@ public final class FeishuWebhookSender {
                                  boolean enableSign, String secret, Logger logger) throws Exception {
         String fullMarkdown = (prefix == null ? "" : prefix) + markdownContent;
 
-        // Current time in seconds (Feishu requires second-precision timestamps).
         long timestamp = System.currentTimeMillis() / 1000L;
 
         JsonObject body = new JsonObject();
@@ -104,8 +85,7 @@ public final class FeishuWebhookSender {
             }
         }
 
-        // 交互式卡片 (interactive): 一个 markdown 元素承载结构化文本,
-        // 使 <font color="red">**..**</font> 红色加粗样式生效.
+        // 交互式卡片：一个 markdown 元素承载结构化文本
         body.addProperty("msg_type", "interactive");
 
         JsonObject card = new JsonObject();
@@ -120,15 +100,15 @@ public final class FeishuWebhookSender {
         body.add("card", card);
 
         HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create(webhookUrl))
-            .header("Content-Type", "application/json")
-            .timeout(Duration.ofSeconds(15))
-            .POST(HttpRequest.BodyPublishers.ofString(body.toString(), StandardCharsets.UTF_8))
-            .build();
+                .uri(URI.create(webhookUrl))
+                .header("Content-Type", "application/json")
+                .timeout(Duration.ofSeconds(15))
+                .POST(HttpRequest.BodyPublishers.ofString(body.toString(), StandardCharsets.UTF_8))
+                .build();
 
         HttpResponse<String> response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
 
-        // Feishu returns HTTP 200 even on logical failures; inspect the JSON "code" field.
+        // 飞书逻辑失败也返回 HTTP 200，需检查 JSON code 字段
         int httpCode = response.statusCode();
         int bizCode = -1;
         String bizMsg = "";
@@ -137,23 +117,21 @@ public final class FeishuWebhookSender {
             if (json.has("code")) bizCode = json.get("code").getAsInt();
             if (json.has("msg")) bizMsg = json.get("msg").getAsString();
         } catch (Throwable ignored) {
-            // Non-JSON / empty body; fall back to raw text below.
         }
 
         if (httpCode == 200 && bizCode == 0) {
             logger.info("[xYuan's Mod] Feishu webhook delivered.");
         } else {
             logger.error("[xYuan's Mod] Feishu webhook rejected: http={}, code={}, msg={}, body={}",
-                httpCode, bizCode, bizMsg, response.body());
+                    httpCode, bizCode, bizMsg, response.body());
         }
     }
 
     /**
-     * Generates the Feishu custom-bot signature.
+     * 生成飞书自定义机器人签名。
      *
-     * <p>Per the official spec: use {@code timestamp + "\n" + secret} as the
-     * HmacSHA256 key to sign an <b>empty</b> byte array, then Base64-encode.
-     * The timestamp is expressed in seconds and is valid for 1 hour.</p>
+     * <p>以 {@code timestamp + "\n" + secret} 作为 HmacSHA256 密钥对空字节数组签名，再 Base64 编码。
+     * timestamp 为秒级字符串，有效期为 1 小时。</p>
      */
     static String genSign(String secret, long timestamp) throws Exception {
         String stringToSign = timestamp + "\n" + secret;
@@ -163,18 +141,5 @@ public final class FeishuWebhookSender {
         byte[] signData = mac.doFinal(new byte[]{});
 
         return Base64.getEncoder().encodeToString(signData);
-    }
-
-    /** Best-effort shutdown hook (invoked from the addon / module deactivate if desired). */
-    public static void shutdown() {
-        EXECUTOR.shutdown();
-        try {
-            if (!EXECUTOR.awaitTermination(2, TimeUnit.SECONDS)) {
-                EXECUTOR.shutdownNow();
-            }
-        } catch (InterruptedException ignored) {
-            EXECUTOR.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
     }
 }
