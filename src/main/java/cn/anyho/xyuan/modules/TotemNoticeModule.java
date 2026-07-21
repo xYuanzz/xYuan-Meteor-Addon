@@ -119,7 +119,7 @@ public class TotemNoticeModule extends Module {
         if (entity != mc.player) {
             return;
         }
-        if (!isOnTargetServer()) {
+        if (isNotOnTargetServer()) {
             return;
         }
 
@@ -139,15 +139,22 @@ public class TotemNoticeModule extends Module {
         lastDamageTimeMs = System.currentTimeMillis();
     }
 
-    /** 处理玩家死亡数据包：仅处理本地玩家的死亡，推送携带死亡信息的提醒。 */
+    /**
+     * 处理玩家死亡数据包：仅处理本地玩家的死亡，推送携带死亡信息的提醒。
+     *
+     * <p>关键：{@code mc.player} 为 null 时仍发送死亡提醒。图腾触发后极短时间内被杀死时，
+     * 客户端可能处于过渡状态导致 {@code mc.player} 被清空，而 {@link DeathMessageS2CPacket}
+     * 是服务端专门发给当前客户端的死亡通知，{@code playerId()} 就是本地玩家，不应丢弃。
+     * 仅在 {@code mc.player} 存在时校验 {@code playerId} 防止其他玩家死亡误报。</p>
+     */
     private void handleDeathMessage(DeathMessageS2CPacket packet) {
-        if (!enableDeathNotify.get() || mc.player == null) {
+        if (!enableDeathNotify.get()) {
             return;
         }
-        if (packet.playerId() != mc.player.getId()) {
+        if (mc.player != null && packet.playerId() != mc.player.getId()) {
             return;
         }
-        if (!isOnTargetServer()) {
+        if (isNotOnTargetServer()) {
             return;
         }
         capturePlayerName();
@@ -286,15 +293,15 @@ public class TotemNoticeModule extends Module {
         }
     }
 
-    /** 启用「不校验服务器地址」时直接返回 true；否则按地址包含 3c3u.org 判定。 */
-    private boolean isOnTargetServer() {
+    /** 启用「不校验服务器地址」时返回 false；否则按地址不包含 3c3u.org 判定。 */
+    private boolean isNotOnTargetServer() {
         if (skipServerCheck.get()) {
-            return true;
-        }
-        if (mc.getCurrentServerEntry() == null) {
             return false;
         }
+        if (mc.getCurrentServerEntry() == null) {
+            return true;
+        }
         String address = mc.getCurrentServerEntry().address;
-        return address != null && address.toLowerCase().contains("3c3u.org");
+        return address == null || !address.toLowerCase().contains("3c3u.org");
     }
 }
