@@ -42,7 +42,7 @@ public class FeishuWebhookModule extends Module {
             .description("飞书机器人签名密钥，启用签名校验时必填。")
             .defaultValue("")
             .wide()
-            .visible(() -> enableSign.get())
+            .visible(enableSign::get)
             .build()
     );
 

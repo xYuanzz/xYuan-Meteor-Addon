@@ -213,6 +213,7 @@ public class QueueNoticeModule extends Module {
      * 高优先级 GameLeftEvent 处理器：先于 Meteor 的 Modules.onGameLeft 执行，
      * 设置 leavingGame 标志并安排延迟退出通知。
      */
+    @SuppressWarnings("unused")
     @EventHandler(priority = EventPriority.HIGH)
     private void onGameLeftHigh(GameLeftEvent event) {
         leavingGame = true;
@@ -243,32 +244,35 @@ public class QueueNoticeModule extends Module {
         }
     }
 
+    @SuppressWarnings("unused")
     @EventHandler
     private void onGameJoined(GameJoinedEvent event) {
         onTargetServer = isOnTargetServer();
         capturePlayerName();
     }
 
+    @SuppressWarnings("unused")
     @EventHandler
     private void onReceiveMessage(ReceiveMessageEvent event) {
         handleText(event.getMessage().getString());
     }
 
     /** 数据包接收：标题 / 副标题 / 动作栏（解析队列文本）、服务器主动断开（捕获异常原因）。 */
+    @SuppressWarnings("unused")
     @EventHandler
     private void onPacketReceive(PacketEvent.Receive event) {
         Packet<?> packet = event.packet;
 
-        if (packet instanceof TitleS2CPacket p) {
-            handleText(p.text().getString());
-        } else if (packet instanceof SubtitleS2CPacket p) {
-            handleText(p.text().getString());
-        } else if (packet instanceof OverlayMessageS2CPacket p) {
-            handleText(p.text().getString());
-        } else if (packet instanceof DisconnectS2CPacket p) {
+        if (packet instanceof TitleS2CPacket(var text)) {
+            handleText(text.getString());
+        } else if (packet instanceof SubtitleS2CPacket(var text)) {
+            handleText(text.getString());
+        } else if (packet instanceof OverlayMessageS2CPacket(var text)) {
+            handleText(text.getString());
+        } else if (packet instanceof DisconnectS2CPacket(var reason)) {
             if (onTargetServer) {
                 capturedAbnormalDisconnect = true;
-                capturedDisconnectReason = p.reason().getString();
+                capturedDisconnectReason = reason.getString();
             }
         }
     }

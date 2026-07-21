@@ -89,6 +89,7 @@ public class TotemNoticeModule extends Module {
      *
      * <p>vanilla 受伤流程中伤害包先于图腾包到达，本模块缓存最近一次伤害供图腾触发时读取。</p>
      */
+    @SuppressWarnings("unused")
     @EventHandler
     private void onPacketReceive(PacketEvent.Receive event) {
         // 玩家死亡：优先处理（独立于图腾触发）
@@ -271,11 +272,9 @@ public class TotemNoticeModule extends Module {
         String player = (playerName == null || playerName.isEmpty()) ? "unknown" : playerName;
         String msg = (deathMessage == null || deathMessage.isEmpty()) ? "已死亡" : deathMessage;
 
-        StringBuilder sb = new StringBuilder();
-        sb.append("<font color=\"red\">**").append(msg).append("**</font>\n");
-        sb.append("玩家:").append(player).append("\n");
-        sb.append("触发时间:").append(time);
-        return sb.toString();
+        return "<font color=\"red\">**" + msg + "**</font>\n"
+                + "玩家:" + player + "\n"
+                + "触发时间:" + time;
     }
 
     private void capturePlayerName() {
