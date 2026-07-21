@@ -47,7 +47,9 @@ xYuan's Mod/
     └── java/cn/anyho/xyuan/
         ├── QueueNoticeAddon.java    # 主类，继承 MeteorAddon，注册模块与分类
         ├── modules/
-        │   └── QueueNoticeModule.java  # 模块类，设置项 + 事件监听 + 触发逻辑
+        │   ├── FeishuWebhookModule.java  # 飞书Webhook模块（集中管理 Webhook 配置，供其他模块共用）
+        │   ├── QueueNoticeModule.java    # 队列提醒模块（设置项 + 事件监听 + 触发逻辑）
+        │   └── TotemNoticeModule.java    # 图腾提醒模块（EntityStatusS2CPacket 监听 + 背包统计）
         └── util/
             ├── QueueParser.java        # 队列文本正则匹配 / 位置提取
             └── FeishuWebhookSender.java # 飞书 Webhook 请求构造 / 签名 / 异步发送
