@@ -1,18 +1,18 @@
 package cn.anyho.xyuan.modules;
 
 import cn.anyho.xyuan.QueueNoticeAddon;
-import cn.anyho.xyuan.util.FeishuWebhookSender;
 import cn.anyho.xyuan.util.QueueParser;
 import meteordevelopment.meteorclient.events.game.GameJoinedEvent;
 import meteordevelopment.meteorclient.events.game.GameLeftEvent;
 import meteordevelopment.meteorclient.events.game.ReceiveMessageEvent;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.settings.BoolSetting;
+import meteordevelopment.meteorclient.settings.EnumSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
-import meteordevelopment.meteorclient.settings.StringSetting;
 import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.orbit.EventHandler;
 import meteordevelopment.orbit.EventPriority;
 import net.minecraft.network.packet.Packet;
@@ -40,7 +40,8 @@ import java.util.concurrent.TimeUnit;
  * <h2>触发场景</h2>
  * <ol>
  *   <li><b>入队提醒</b>：首次检测到有效队列位置时触发。</li>
- *   <li><b>进度提醒</b>：自上次进度提醒以来前进位数 ≥ 提醒步长时触发。</li>
+ *   <li><b>进度提醒</b>：按「进度通知模式」触发——默认模式下位置 ≤ 5 每名通知、
+ *       其余仅整十位置通知；自定义模式下自上次提醒以来前进位数 ≥ 提醒步长时触发。</li>
  *   <li><b>即将进入服务器提醒</b>：队列位置到达 1 时触发（仅一次），表示即将进服。</li>
  *   <li><b>完成提醒</b>：BungeeCord/Velocity 切换子服时触发（由 {@link GameJoinedEvent}
  *       检测，对应代理切换走配置阶段 + 重新 Login 流程，而非维度切换）。</li>
@@ -48,9 +49,10 @@ import java.util.concurrent.TimeUnit;
  *       <b>仅在本会话首次进入主服时触发</b>，避免主服 ↔ 登录服反复切换时重复发送
  *       （通过 {@code enteredMainServer} 标志防重复；真正退出服务器后重置）。</li>
  *   <li><b>模块关闭提醒</b>：玩家手动关闭本模块时触发（{@link #onDeactivate()}）。</li>
- *   <li><b>正常退出服务器提醒</b>：玩家主动断开连接（退出到主菜单）时触发（延迟判定）。</li>
+ *   <li><b>正常退出服务器提醒</b>：玩家主动断开连接（退出到主菜单）时触发（延迟判定），
+ *       类型字段为「离队」。</li>
  *   <li><b>异常断开提醒</b>：服务器发送 {@link DisconnectS2CPacket} 主动断开时触发，
- *       携带断开时的报错原文。</li>
+ *       携带断开时的报错原文，类型字段为「离队」。</li>
  * </ol>
  *
  * <h2>退出与切换子服的区分</h2>
@@ -59,8 +61,10 @@ import java.util.concurrent.TimeUnit;
  * 会触发 {@link GameJoinedEvent}（重新 {@link #onActivate()}）。本模块用高优先级
  * {@link GameLeftEvent} 处理器（{@link #onGameLeftHigh(GameLeftEvent)}）先于 Meteor 的
  * {@code Modules.onGameLeft} 执行，设置 {@code leavingGame} 标志，并在 {@code onDeactivate}
- * 中不重置排队状态；若 {@link #EXIT_DETECT_DELAY_SECONDS} 内收到 {@link GameJoinedEvent}
- * （切换子服），则发完成提醒并取消退出通知；否则判定为真正退出，发送退出/异常通知。
+ * 中不重置排队状态；若 {@link #EXIT_DETECT_DELAY_SECONDS}（5 秒）内收到 {@link GameJoinedEvent}
+ * （切换子服），则发完成提醒并取消退出通知；否则判定为真正退出，发送退出/离队通知。
+ * 延迟任务还会二次校验 {@code mc.world != null}：若届时已连接到新世界（切换子服完成但
+ * {@code onActivate} 尚未触发），同样判定为切换子服，不发通知。
  *
  * <h2>无排队进入提醒的防重复</h2>
  * BungeeCord 主服 ↔ 登录服切换都会触发 {@code onActivate} 且 {@code inQueue=false}，无法
@@ -73,119 +77,125 @@ import java.util.concurrent.TimeUnit;
  */
 public class QueueNoticeModule extends Module {
 
+    /**
+     * 进度通知模式（二选一）。
+     * <ul>
+     *   <li>{@link #DEFAULT}：整十位置通知（90/80/70…），且排名 ≤ 5 时每前进一名都通知。</li>
+     *   <li>{@link #CUSTOM}：按自定义步长通知（每前进 N 名触发一次）。</li>
+     * </ul>
+     *
+     * <p>重写 {@link #toString()} 返回中文，Meteor {@code EnumSetting} 的 GUI 显示、
+     * 命令补全与配置序列化均使用 {@code toString()}。</p>
+     */
+    public enum NotifyMode {
+        /** 默认模式：整十位置通知 + 前 5 每名通知。 */
+        DEFAULT,
+        /** 自定义模式：按「提醒步长」自定义通知频率。 */
+        CUSTOM;
+
+        @Override
+        public String toString() {
+            return switch (this) {
+                case DEFAULT -> "默认";
+                case CUSTOM -> "自定义";
+            };
+        }
+    }
+
     private static final DateTimeFormatter TIME_FORMAT =
-        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     /** 目标服务器地址关键字（包含即生效）。 */
     private static final String TARGET_SERVER = "3c3u.org";
 
     /**
      * 退出判定延迟（秒）：在此时间内收到 {@link GameJoinedEvent}（即 {@link #onActivate()}
-     * 被调用）视为切换子服，发完成提醒；否则判定为真正退出，发送退出/异常通知。
+     * 被调用）视为切换子服，发完成提醒；否则判定为真正退出，发送退出/离队通知。
+     *
+     * <p>取 5 秒以兼容 BungeeCord 切换子服的耗时（disconnect → 重新连接 → GameJoinedEvent
+     * 全流程可能超过 2 秒）。延迟任务内部还会二次校验 {@code mc.world}：若届时已连接到
+     * 新子服，同样判定为切换子服，不发通知。</p>
      */
-    private static final long EXIT_DETECT_DELAY_SECONDS = 2;
+    private static final long EXIT_DETECT_DELAY_SECONDS = 5;
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
-    private final SettingGroup sgWebhook = settings.createGroup("Webhook");
-    private final SettingGroup sgSign = settings.createGroup("签名校验");
     private final SettingGroup sgAdvanced = settings.createGroup("高级");
 
     // ---------- 基础设置 ----------
 
-    /** 每前进多少名触发一次进度提醒（最小值 1，对应飞书限流的安全下限）。 */
+    /** 进度通知模式：默认（整十 + 前5每名）或自定义（按步长），二选一。 */
+    private final Setting<NotifyMode> notifyMode = sgGeneral.add(new EnumSetting.Builder<NotifyMode>()
+            .name("进度通知模式")
+            .description("默认：整十位置通知（90/80/70…），且排名 ≤ 5 时每前进一名都通知。"
+                    + "自定义：按「提醒步长」自定义通知频率。两者二选一。")
+            .defaultValue(NotifyMode.DEFAULT)
+            .build()
+    );
+
+    /**
+     * 自定义提醒步长：每前进多少名触发一次进度提醒（最小值 1）。
+     * 仅在「进度通知模式」选择「自定义」时显示与生效。
+     */
     private final Setting<Integer> reminderStep = sgGeneral.add(new IntSetting.Builder()
-        .name("提醒步长")
-        .description("每前进多少名触发一次进度提醒。最小值 1。")
-        .defaultValue(10)
-        .range(1, 1000)
-        .sliderRange(1, 100)
-        .build()
+            .name("提醒步长")
+            .description("每前进多少名触发一次进度提醒。仅在「进度通知模式」选择「自定义」时生效。最小值 1。")
+            .defaultValue(10)
+            .range(1, 1000)
+            .sliderRange(1, 100)
+            .visible(() -> notifyMode.get() == NotifyMode.CUSTOM)
+            .build()
     );
 
     private final Setting<Boolean> enableJoinNotify = sgGeneral.add(new BoolSetting.Builder()
-        .name("启用入队提醒")
-        .description("首次检测到排队位置时触发入队提醒。")
-        .defaultValue(true)
-        .build()
+            .name("启用入队提醒")
+            .description("首次检测到排队位置时触发入队提醒。")
+            .defaultValue(true)
+            .build()
     );
 
     private final Setting<Boolean> enableCompleteNotify = sgGeneral.add(new BoolSetting.Builder()
-        .name("启用完成提醒")
-        .description("排队结束、切换子服进入游戏世界时触发完成提醒。")
-        .defaultValue(true)
-        .build()
+            .name("启用完成提醒")
+            .description("排队结束、切换子服进入游戏世界时触发完成提醒。")
+            .defaultValue(true)
+            .build()
     );
 
     private final Setting<Boolean> enableNoQueueNotify = sgGeneral.add(new BoolSetting.Builder()
-        .name("启用无排队进入提醒")
-        .description("未排队直接进入游戏子服时触发提醒（如登录子服直接传送进服）。")
-        .defaultValue(true)
-        .build()
+            .name("启用无排队进入提醒")
+            .description("未排队直接进入游戏子服时触发提醒（如登录子服直接传送进服）。")
+            .defaultValue(true)
+            .build()
     );
 
     private final Setting<Boolean> enableModuleCloseNotify = sgGeneral.add(new BoolSetting.Builder()
-        .name("启用模块关闭提醒")
-        .description("玩家手动关闭本模块时触发提醒。")
-        .defaultValue(true)
-        .build()
+            .name("启用模块关闭提醒")
+            .description("玩家手动关闭本模块时触发提醒。")
+            .defaultValue(true)
+            .build()
     );
 
     private final Setting<Boolean> enableExitNotify = sgGeneral.add(new BoolSetting.Builder()
-        .name("启用退出服务器提醒")
-        .description("玩家主动断开服务器连接时触发提醒。")
-        .defaultValue(true)
-        .build()
+            .name("启用退出服务器提醒")
+            .description("玩家主动断开服务器连接时触发提醒。")
+            .defaultValue(true)
+            .build()
     );
 
     private final Setting<Boolean> enableAbnormalNotify = sgGeneral.add(new BoolSetting.Builder()
-        .name("启用异常断开提醒")
-        .description("服务器异常断开连接时触发提醒，携带断开时的报错原文。")
-        .defaultValue(true)
-        .build()
-    );
-
-    // ---------- Webhook 设置 ----------
-
-    private final Setting<String> webhookUrl = sgWebhook.add(new StringSetting.Builder()
-        .name("飞书Webhook地址")
-        .description("飞书自定义机器人的完整 Webhook 地址。")
-        .defaultValue("")
-        .wide()
-        .build()
-    );
-
-    private final Setting<String> messagePrefix = sgWebhook.add(new StringSetting.Builder()
-        .name("自定义消息前缀")
-        .description("用于适配飞书机器人关键词安全校验，自动添加到消息开头。")
-        .defaultValue("")
-        .build()
-    );
-
-    // ---------- 安全设置（飞书签名校验） ----------
-
-    private final Setting<Boolean> enableSign = sgSign.add(new BoolSetting.Builder()
-        .name("启用签名校验")
-        .description("启用飞书签名校验（HmacSHA256 + Base64）。")
-        .defaultValue(false)
-        .build()
-    );
-
-    private final Setting<String> signSecret = sgSign.add(new StringSetting.Builder()
-        .name("签名密钥")
-        .description("飞书机器人签名密钥，启用签名校验时必填。")
-        .defaultValue("")
-        .wide()
-        .build()
+            .name("启用异常断开提醒")
+            .description("服务器异常断开连接时触发提醒，携带断开时的报错原文。")
+            .defaultValue(true)
+            .build()
     );
 
     // ---------- 高级设置 ----------
 
     /** 跳过 3c3u.org 白名单校验，允许在任意服务器触发排队提醒。 */
     private final Setting<Boolean> skipServerCheck = sgAdvanced.add(new BoolSetting.Builder()
-        .name("不校验服务器地址")
-        .description("跳过 3c3u.org 白名单校验，允许在任意服务器触发排队提醒。")
-        .defaultValue(false)
-        .build()
+            .name("不校验服务器地址")
+            .description("跳过 3c3u.org 白名单校验，允许在任意服务器触发排队提醒。")
+            .defaultValue(false)
+            .build()
     );
 
     // ---------- 运行时状态 ----------
@@ -309,13 +319,18 @@ public class QueueNoticeModule extends Module {
         exitCancelled = false;
         if (inQueue) {
             // 排队中：延迟判定，若 EXIT_DETECT_DELAY_SECONDS 内未收到 onActivate（切换子服），
-            // 则判定为真正退出，发送退出/异常通知
+            // 则判定为真正退出，发送退出/离队通知
             exitDetector.schedule(() -> {
                 if (exitCancelled) {
                     // 切换子服，onActivate 已取消
                     return;
                 }
-                // 真正退出：发送退出/异常通知，重置会话状态
+                // 二次校验：若此时已连接到新世界（切换子服完成但 onActivate 尚未触发），
+                // 同样判定为切换子服，不发退出通知
+                if (mc.world != null) {
+                    return;
+                }
+                // 真正退出：发送退出/离队通知，重置会话状态
                 leavingGame = false;
                 enteredMainServer = false;
                 sendExitOrAbnormalReminder();
@@ -409,7 +424,7 @@ public class QueueNoticeModule extends Module {
 
             // 位置为 1 → 即将进入服务器提醒（仅一次）
             if (position == 1) {
-                fireAboutToEnterReminder();
+                fireAboutToEnterReminder(0);
             }
             return;
         }
@@ -420,28 +435,66 @@ public class QueueNoticeModule extends Module {
         // ----- 位置到达 1 → 即将进入服务器提醒（仅一次） -----
         if (position == 1) {
             if (!notifiedAboutToEnter) {
-                fireAboutToEnterReminder();
+                fireAboutToEnterReminder(forward);
             }
             return; // 位置 1 不再触发进度提醒
         }
 
-        // ----- 进度提醒：自上次提醒以来前进位数 ≥ 步长 -----
-        if (forward > 0 && (lastNotifiedPosition - position) >= reminderStep.get()) {
+        // ----- 进度提醒 -----
+        if (forward > 0 && shouldNotifyProgress(position)) {
             int advance = lastNotifiedPosition - position;
             sendReminder(buildMarkdown("", "进度", advance, position, null));
             lastNotifiedPosition = position;
         }
     }
 
-    /** 触发「即将进入服务器」提醒（位置=1），自带防重复。 */
-    private void fireAboutToEnterReminder() {
+    /**
+     * 判断当前前进是否应触发进度提醒。
+     *
+     * <ul>
+     *   <li>{@link NotifyMode#DEFAULT}：位置 ≤ 5 时每前进一名都通知；否则当自上次通知以来
+     *       <b>跨过（含恰好落到）任意一个整十位置</b>时通知。例如 76 → 66 跨过 70，应通知；
+     *       76 → 70 恰好落到 70，应通知；76 → 71 未跨过整十位置，不通知。</li>
+     *   <li>{@link NotifyMode#CUSTOM}：自上次提醒以来前进位数 ≥ {@link #reminderStep} 时通知。</li>
+     * </ul>
+     *
+     * @param position 当前队列位置（已前进，调用方保证 forward > 0）
+     */
+    private boolean shouldNotifyProgress(int position) {
+        if (notifyMode.get() == NotifyMode.DEFAULT) {
+            // 默认模式：前 5 每名通知
+            if (position <= 5) {
+                return true;
+            }
+            // 其余位置：检查 [position, lastNotifiedPosition) 区间内是否存在 10 的倍数。
+            // 即是否存在整数 k 满足 position <= 10k < lastNotifiedPosition，
+            // 等价于 ceil(position/10) <= floor((lastNotifiedPosition-1)/10)。
+            // 用整数除法实现：ceil(position/10) = (position + 9) / 10，
+            // floor((lastNotifiedPosition-1)/10) = (lastNotifiedPosition - 1) / 10。
+            // 这样无论一次跨过多少名、是否恰好落到整十位置，都能正确触发通知。
+            int lowestMultipleAtOrAbovePos = (position + 9) / 10;
+            int highestMultipleBelowLast = (lastNotifiedPosition - 1) / 10;
+            return highestMultipleBelowLast >= lowestMultipleAtOrAbovePos;
+        }
+        // 自定义模式：按步长通知
+        return (lastNotifiedPosition - position) >= reminderStep.get();
+    }
+
+    /**
+     * 触发「即将进入服务器」提醒（位置=1），自带防重复。
+     *
+     * @param forward 本次前进位数（首次检测到位置 1 时为 0；从其他位置前进到 1 时为实际差值）
+     */
+    private void fireAboutToEnterReminder(int forward) {
         notifiedAboutToEnter = true;
-        sendReminder(buildMarkdown("", "通知", 0, 1, "即将进入服务器!"));
+        sendReminder(buildMarkdown("", "通知", forward, 1, "即将进入服务器!"));
     }
 
     /**
      * 发送退出服务器 / 异常断开提醒（根据是否捕获到异常断开包区分）。
      * 由 {@link #onGameLeftHigh(GameLeftEvent)} 的延迟任务调用（真正退出时）。
+     *
+     * <p>两者的「类型」字段统一为「离队」，便于在飞书群按类型筛选。</p>
      */
     private void sendExitOrAbnormalReminder() {
         int pos = lastPosition;
@@ -450,11 +503,11 @@ public class QueueNoticeModule extends Module {
 
         if (abnormal) {
             if (enableAbnormalNotify.get()) {
-                sendReminder(buildMarkdown("", "通知", 0, pos,
-                    "异常断开连接(" + (reason == null ? "未知原因" : reason) + ")"));
+                sendReminder(buildMarkdown("", "离队", 0, pos,
+                        "异常断开连接(" + (reason == null ? "未知原因" : reason) + ")"));
             }
         } else if (enableExitNotify.get()) {
-            sendReminder(buildMarkdown("", "通知", 0, pos, "已退出服务器,排队已停止!"));
+            sendReminder(buildMarkdown("", "离队", 0, pos, "已退出服务器,排队已停止!"));
         }
     }
 
@@ -495,20 +548,19 @@ public class QueueNoticeModule extends Module {
         return "<font color=\"red\">**" + value + "**</font>";
     }
 
-    /** 异步推送提醒到飞书 Webhook（不阻塞主线程）。 */
+    /**
+     * 异步推送提醒到飞书 Webhook（通过 FeishuWebhookModule 统一管理配置，不阻塞主线程）。
+     *
+     * <p>不校验 {@code FeishuWebhookModule.isActive()}：该模块未启用，
+     * 其中的 Webhook 地址、签名等设置仍能生效，供队列提醒与图腾提醒共用。
+     * {@link FeishuWebhookModule#sendMarkdown(String)} 内部会在 Webhook 地址为空时直接返回，
+     * 避免无效请求。</p>
+     */
     private void sendReminder(String markdownContent) {
-        String url = webhookUrl.get();
-        if (url == null || url.isBlank()) {
-            return;
+        FeishuWebhookModule webhook = Modules.get().get(FeishuWebhookModule.class);
+        if (webhook != null) {
+            webhook.sendMarkdown(markdownContent);
         }
-        FeishuWebhookSender.sendAsync(
-            url,
-            messagePrefix.get(),
-            markdownContent,
-            enableSign.get(),
-            signSecret.get(),
-            QueueNoticeAddon.LOG
-        );
     }
 
     // ---------- 工具方法 ----------
