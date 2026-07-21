@@ -3,7 +3,7 @@
 > 作者：**xYuan**
 
 基于 [Meteor Client Addon API](https://github.com/MeteorDevelopment/meteor-client) 开发的队列位置监控附属插件。
-实时识别服务器排队位置，并通过**飞书自定义机器人 Webhook** 推送排队进度提醒，支持自定义前进名次触发阈值。
+实时识别服务器排队位置，并通过**飞书自定义机器人 Webhook** 推送排队进度提醒，支持自定义前进名次触发阈值。(目前仅支持3c3u.org服务器)
 
 - 队列检测逻辑参考：[SnowZhouer/queue-notice-mod](https://github.com/SnowZhouer/queue-notice-mod)
 - 项目结构参考：[MeteorDevelopment/meteor-addon-template](https://github.com/MeteorDevelopment/meteor-addon-template)
@@ -16,16 +16,13 @@
 ### 1. 生效范围限制（3c3u.org 白名单）
 
 
-### 2. 队列位置监控
+### 2. webhook提醒
+ - 队列位置
+ - 图腾触发
+ - 死亡信息
 
 
-### 3.  图腾/死亡 提醒
-
-
-### 4. 八种触发场景
-
-
-### 5. 飞书 Webhook 推送
+### 3. 飞书 Webhook 推送
 
 
 ---
@@ -84,15 +81,15 @@ gradle wrapper --gradle-version 9.2.0
 gradlew.bat build
 ```
 
-构建产物位于 `build/libs/xYuan's Mod-1.0.0.jar`。
+构建产物位于 `build/libs`。
 
 ---
 
 ## 部署说明
 
-1. 确保已安装对应版本的 **Meteor Client**（适配 MC 1.21.11）与 **Fabric Loader**（0.18.2）
+1. 确保已安装对应版本的 **Meteor Client**（适配 MC 1.21.11）与 **Fabric Loader**
 2. 将构建产物 `xYuan's Mod.jar` 放入 Minecraft 的 `mods` 目录
-3. 启动游戏，Meteor 会自动加载本附属并在模块列表中新增「xYuan's Mod」分类，下设「队列提醒」模块
+3. 启动游戏，Meteor 会自动加载本附属并在模块列表中新增「xYuan's Mod」分类。
 
 ---
 
@@ -100,7 +97,8 @@ gradlew.bat build
 
 ### 第一步：配置飞书自定义机器人
 
-1. 在飞书群聊中「设置 → 群机器人 → 添加机器人 → 自定义机器人」，获取 **Webhook 地址** 与（可选）**签名校验密钥**
+
+1. 在飞书群聊中「设置 → 群机器人 → 添加机器人 → 自定义机器人（若找不到请用PC端操作）」，获取 **Webhook 地址** 与（可选）**签名校验密钥**
 2. 如启用了「自定义关键词」安全校验，请把关键词填入模块的「自定义消息前缀」设置项（消息会自动以该前缀开头，从而通过校验）
 3. 如启用了「签名校验」，记下签名密钥，稍后在模块中填写
 
