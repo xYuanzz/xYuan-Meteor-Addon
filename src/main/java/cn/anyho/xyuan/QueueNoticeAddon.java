@@ -2,6 +2,7 @@ package cn.anyho.xyuan;
 
 import cn.anyho.xyuan.modules.FeishuWebhookModule;
 import cn.anyho.xyuan.modules.PacketDebugModule;
+import cn.anyho.xyuan.modules.PlayerRadarModule;
 import cn.anyho.xyuan.modules.QueueNoticeModule;
 import cn.anyho.xyuan.modules.TotemNoticeModule;
 import com.mojang.logging.LogUtils;
@@ -24,6 +25,7 @@ public class QueueNoticeAddon extends MeteorAddon {
         Modules.get().add(new QueueNoticeModule());
         Modules.get().add(new TotemNoticeModule());
         Modules.get().add(new PacketDebugModule());
+        Modules.get().add(new PlayerRadarModule());
     }
 
     @Override
