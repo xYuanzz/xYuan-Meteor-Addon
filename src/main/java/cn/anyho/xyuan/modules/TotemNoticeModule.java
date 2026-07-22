@@ -15,16 +15,33 @@ import net.minecraft.item.Items;
 import net.minecraft.network.packet.s2c.play.DeathMessageS2CPacket;
 import net.minecraft.network.packet.s2c.play.EntityDamageS2CPacket;
 import net.minecraft.network.packet.s2c.play.EntityStatusS2CPacket;
+import net.minecraft.network.packet.s2c.play.GameMessageS2CPacket;
+import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.text.Text;
+import net.minecraft.text.TranslatableTextContent;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Optional;
 
 /**
  * 图腾提醒模块：监控本地玩家不死图腾触发与玩家死亡，通过飞书 Webhook 推送提醒。
  *
- * <p>图腾触发附带伤害来源（类型 ID + 来源实体名）与背包剩余图腾数量；
- * 死亡携带游戏返回的死亡信息。不做防重复去抖，避免漏掉关键信息。</p>
+ * <p>图腾触发附带伤害来源（伤害类型键名 + 来源实体名）与背包剩余图腾数量；
+ * 死亡携带游戏返回的死亡信息与触发伤害。不做防重复去抖，避免漏掉关键信息。</p>
+ *
+ * <p><b>3c3u 死因回退</b>：3c3u 服务端把 {@link DeathMessageS2CPacket#message()} 清空，
+ * 模块按优先级回退获取死因文本与触发伤害：
+ * <ol>
+ *   <li>正常服务器：直接用 {@code DeathMessageS2CPacket.message().getString()}</li>
+ *   <li>方案 B：取最近 1 秒内本地玩家死亡广播 {@link GameMessageS2CPacket} 的 content
+ *       （聊天栏 death.* 翻译消息，含完整死因文本）</li>
+ *   <li>方案 A：取最近 {@link #DAMAGE_WINDOW_MS} 内 {@link EntityDamageS2CPacket}
+ *       缓存的伤害类型键名（如 fall，去掉 minecraft: 前缀）构造简化描述</li>
+ *   <li>兜底「已死亡」</li>
+ * </ol>
+ * 触发伤害字段统一从 {@link EntityDamageS2CPacket} 缓存读取伤害类型键名（去掉 minecraft: 前缀）。</p>
  */
 public class TotemNoticeModule extends Module {
 
@@ -34,8 +51,11 @@ public class TotemNoticeModule extends Module {
     /** 实体状态码 35 = 不死图腾触发（vanilla 协议约定）。 */
     private static final byte TOTEM_STATUS = 35;
 
-    /** 伤害缓存有效期（毫秒）：图腾触发时仅读取此窗口内的伤害，避免误用旧伤害。 */
+    /** 伤害缓存有效期（毫秒）：图腾触发与死亡时仅读取此窗口内的伤害，避免误用旧伤害。 */
     private static final long DAMAGE_WINDOW_MS = 500;
+
+    /** 死亡广播缓存有效期（毫秒）：DeathMessageS2CPacket 到达时关联最近的 GameMessageS2CPacket 死亡广播。 */
+    private static final long DEATH_BROADCAST_WINDOW_MS = 1000;
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgAdvanced = settings.createGroup("高级");
@@ -65,10 +85,14 @@ public class TotemNoticeModule extends Module {
 
     private String playerName;
 
-    /** 缓存最近一次本地玩家受到的伤害（供图腾触发时读取伤害来源）。 */
+    /** 缓存最近一次本地玩家受到的伤害（供图腾触发与死亡时读取伤害来源）。 */
     private RegistryEntry<DamageType> lastDamageType;
     private int lastDamageCauseId = -1;
     private long lastDamageTimeMs;
+
+    /** 缓存最近一次本地玩家的死亡广播（聊天栏 death.* 翻译消息），供 DeathMessageS2CPacket.message 为空时回退使用。 */
+    private Text lastDeathBroadcastText;
+    private long lastDeathBroadcastTimeMs;
 
     public TotemNoticeModule() {
         super(QueueNoticeAddon.CATEGORY, "图腾提醒", "监控不死图腾触发与玩家死亡并通过飞书 Webhook 推送提醒，附带剩余图腾数量与死亡信息。");
@@ -80,27 +104,36 @@ public class TotemNoticeModule extends Module {
         lastDamageType = null;
         lastDamageCauseId = -1;
         lastDamageTimeMs = 0;
+        lastDeathBroadcastText = null;
+        lastDeathBroadcastTimeMs = 0;
         capturePlayerName();
     }
 
     /**
      * 拦截数据包：死亡（DeathMessageS2CPacket）、伤害（EntityDamageS2CPacket）、
-     * 图腾触发（EntityStatusS2CPacket 状态码 35）。
+     * 死亡广播（GameMessageS2CPacket death.*）、图腾触发（EntityStatusS2CPacket 状态码 35）。
      *
-     * <p>vanilla 受伤流程中伤害包先于图腾包到达，本模块缓存最近一次伤害供图腾触发时读取。</p>
+     * <p>vanilla 受伤流程中伤害包先于图腾包到达，本模块缓存最近一次伤害供图腾触发与死亡时读取。
+     * 3c3u 死亡时聊天广播先于死亡屏幕包到达，本模块缓存最近的本地玩家死亡广播供 message 为空时回退。</p>
      */
     @SuppressWarnings("unused")
     @EventHandler
     private void onPacketReceive(PacketEvent.Receive event) {
-        // 玩家死亡：优先处理（独立于图腾触发）
+        // 玩家死亡（死亡屏幕包）：优先处理（独立于图腾触发）
         if (event.packet instanceof DeathMessageS2CPacket deathPacket) {
             handleDeathMessage(deathPacket);
             return;
         }
 
-        // 伤害包：缓存最近一次本地玩家受到的伤害
+        // 伤害包：缓存最近一次本地玩家受到的伤害（供图腾触发 + 死亡回退读取伤害来源）
         if (event.packet instanceof EntityDamageS2CPacket dmgPacket) {
             cacheDamageIfLocalPlayer(dmgPacket);
+            return;
+        }
+
+        // 死亡广播消息：缓存（方案 B，3c3u 清空 DeathMessageS2CPacket.message 时回退使用）
+        if (event.packet instanceof GameMessageS2CPacket msgPacket) {
+            cacheDeathBroadcastIfLocalPlayer(msgPacket);
             return;
         }
 
@@ -140,12 +173,47 @@ public class TotemNoticeModule extends Module {
     }
 
     /**
-     * 处理玩家死亡数据包：仅处理本地玩家的死亡，推送携带死亡信息的提醒。
+     * 缓存本地玩家的死亡广播（聊天栏 death.* 翻译消息）。
+     *
+     * <p>3c3u 服务端把 {@link DeathMessageS2CPacket#message()} 清空，但聊天栏死亡广播照常发送，
+     * 通过监听 {@link GameMessageS2CPacket} 缓存死亡文本，供死亡屏幕包 message 为空时回退使用（方案 B）。</p>
+     *
+     * <p>双重过滤：①content 是翻译文本且 key 以 "death." 开头（排除普通聊天 / 系统消息）；
+     * ②文本含本地玩家名（排除其他玩家的死亡广播）。死亡广播先于死亡屏幕包到达，缓存时 mc.player 仍在。</p>
+     */
+    private void cacheDeathBroadcastIfLocalPlayer(GameMessageS2CPacket packet) {
+        Text content = packet.content();
+        if (!(content.getContent() instanceof TranslatableTextContent ttc)) {
+            return;
+        }
+        String key = ttc.getKey();
+        if (key == null || !key.startsWith("death.")) {
+            return;
+        }
+        capturePlayerName();
+        if (playerName == null || playerName.isEmpty()) {
+            return;
+        }
+        String text = content.getString();
+        if (!text.contains(playerName)) {
+            return;
+        }
+        lastDeathBroadcastText = content;
+        lastDeathBroadcastTimeMs = System.currentTimeMillis();
+    }
+
+    /**
+     * 处理玩家死亡数据包：仅处理本地玩家的死亡，推送携带死亡文本与触发伤害的提醒。
      *
      * <p>关键：{@code mc.player} 为 null 时仍发送死亡提醒。图腾触发后极短时间内被杀死时，
      * 客户端可能处于过渡状态导致 {@code mc.player} 被清空，而 {@link DeathMessageS2CPacket}
      * 是服务端专门发给当前客户端的死亡通知，{@code playerId()} 就是本地玩家，不应丢弃。
      * 仅在 {@code mc.player} 存在时校验 {@code playerId} 防止其他玩家死亡误报。</p>
+     *
+     * <p>死亡文本优先级：①DeathMessageS2CPacket.message（正常服务器，message 非空时直接用）；
+     * ②最近 1 秒内本地玩家死亡广播 GameMessageS2CPacket 缓存（方案 B，3c3u 清空 message 时回退）；
+     * ③用最近伤害缓存的伤害类型完整键名构造简化描述（方案 A）；④兜底「已死亡」。
+     * 触发伤害字段统一从最近伤害缓存读取完整键名 + 来源实体名。</p>
      */
     private void handleDeathMessage(DeathMessageS2CPacket packet) {
         if (!enableDeathNotify.get()) {
@@ -158,7 +226,42 @@ public class TotemNoticeModule extends Module {
             return;
         }
         capturePlayerName();
-        sendDeathReminder(packet.message().getString());
+
+        // 死亡文本：先走正常路径（message），为空再走 3c3u 兜底逻辑（方案 B → 方案 A → 兜底）
+        String deathText = packet.message().getString();
+        if (deathText == null || deathText.isEmpty()) {
+            deathText = resolveDeathTextFromCache();
+        }
+        // 触发伤害：从最近伤害缓存读取完整键名 + 来源实体名
+        String damageDesc = buildDamageDescription();
+        sendDeathReminder(deathText, damageDesc);
+    }
+
+    /** 死亡文本回退：先取死亡广播缓存（方案 B），再取伤害缓存构造简单描述（方案 A），最后兜底「已死亡」。 */
+    private String resolveDeathTextFromCache() {
+        // 方案 B：从 GameMessageS2CPacket 缓存取死亡广播文本（含完整死因描述）
+        if (lastDeathBroadcastText != null
+                && System.currentTimeMillis() - lastDeathBroadcastTimeMs <= DEATH_BROADCAST_WINDOW_MS) {
+            String text = lastDeathBroadcastText.getString();
+            if (text != null && !text.isEmpty()) {
+                return text;
+            }
+        }
+        // 方案 A：从 EntityDamageS2CPacket 缓存取伤害类型键名，构造简化描述
+        String damageKey = getDamageKeyFromCache();
+        if (damageKey != null) {
+            return "已死亡(" + damageKey + ")";
+        }
+        return "已死亡";
+    }
+
+    /** 从最近伤害缓存读取伤害类型键名（DAMAGE_WINDOW_MS 时间窗内），无缓存或已过期返回 null。 */
+    private String getDamageKeyFromCache() {
+        if (lastDamageType == null || lastDamageTimeMs == 0
+                || System.currentTimeMillis() - lastDamageTimeMs > DAMAGE_WINDOW_MS) {
+            return null;
+        }
+        return getDamageKey(lastDamageType);
     }
 
     /**
@@ -228,59 +331,85 @@ public class TotemNoticeModule extends Module {
     }
 
     /**
-     * 构造图腾触发的伤害来源描述。
+     * 构造伤害来源描述（图腾触发与死亡共用）。
      *
-     * <p>格式：有来源实体时为「伤害类型ID(来源实体名)」；环境伤害仅显示类型 ID；
-     * 无缓存或已过期显示「未知伤害」。yarn 映射中 DamageType 的字段为 msgId。</p>
+     * <p>格式：有来源实体时为「伤害类型键名(来源实体名)」；环境伤害仅显示键名；
+     * 无缓存或已过期显示「未知」。键名形如 fall / drown / mob_attack（去掉 minecraft: 命名空间前缀）。</p>
      */
     private String buildDamageDescription() {
         if (lastDamageType == null || lastDamageTimeMs == 0
                 || System.currentTimeMillis() - lastDamageTimeMs > DAMAGE_WINDOW_MS) {
-            return "未知伤害";
+            return "未知";
         }
 
-        String typeId;
-        try {
-            typeId = lastDamageType.value().msgId();
-        } catch (Throwable ignored) {
-            typeId = "unknown";
-        }
-        if (typeId == null || typeId.isEmpty()) {
-            typeId = "unknown";
+        String damageKey = getDamageKey(lastDamageType);
+        if (damageKey == null || damageKey.isEmpty()) {
+            damageKey = "未知";
         }
 
         if (lastDamageCauseId == -1 || mc.world == null) {
-            return typeId;
+            return damageKey;
         }
         try {
             Entity cause = mc.world.getEntityById(lastDamageCauseId);
             if (cause != null) {
                 String name = cause.getName().getString();
                 if (name != null && !name.isEmpty()) {
-                    return typeId + "(" + name + ")";
+                    return damageKey + "(" + name + ")";
                 }
             }
         } catch (Throwable ignored) {
         }
-        return typeId;
+        return damageKey;
+    }
+
+    /**
+     * 获取伤害类型键名（去掉 minecraft: 命名空间前缀）。
+     *
+     * <p>优先走 {@link RegistryEntry#getKey()} 拿 {@link RegistryKey}，再取 {@code Identifier.toString()}
+     * 并 strip minecraft: 前缀。回退用 {@code DamageType.msgId()}（本身已是不带前缀的短名）。</p>
+     */
+    private String getDamageKey(RegistryEntry<DamageType> entry) {
+        try {
+            Optional<RegistryKey<DamageType>> keyOpt = entry.getKey();
+            if (keyOpt.isPresent()) {
+                return stripMinecraftNamespace(keyOpt.get().getValue().toString());
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            return entry.value().msgId();
+        } catch (Throwable ignored) {
+        }
+        return "unknown";
+    }
+
+    /** 去掉 minecraft: 命名空间前缀（如 minecraft:fall → fall），其他 namespace 保留。 */
+    private String stripMinecraftNamespace(String fullKey) {
+        if (fullKey != null && fullKey.startsWith("minecraft:")) {
+            return fullKey.substring("minecraft:".length());
+        }
+        return fullKey;
     }
 
     /** 构造并发送玩家死亡提醒。第一行为游戏返回的死亡信息（红色加粗）。 */
-    private void sendDeathReminder(String deathMessage) {
+    private void sendDeathReminder(String deathMessage, String damageDescription) {
         FeishuWebhookModule webhook = Modules.get().get(FeishuWebhookModule.class);
         if (webhook != null) {
-            webhook.sendMarkdown(buildDeathMarkdown(deathMessage));
+            webhook.sendMarkdown(buildDeathMarkdown(deathMessage, damageDescription));
         }
     }
 
-    private String buildDeathMarkdown(String deathMessage) {
+    private String buildDeathMarkdown(String deathMessage, String damageDescription) {
         capturePlayerName();
         String time = LocalDateTime.now().format(TIME_FORMAT);
         String player = (playerName == null || playerName.isEmpty()) ? "unknown" : playerName;
         String msg = (deathMessage == null || deathMessage.isEmpty()) ? "已死亡" : deathMessage;
+        String damage = (damageDescription == null || damageDescription.isEmpty()) ? "未知" : damageDescription;
 
         return "<font color=\"red\">**" + msg + "**</font>\n"
                 + "玩家:" + player + "\n"
+                + "触发伤害:" + damage + "\n"
                 + "触发时间:" + time;
     }
 
