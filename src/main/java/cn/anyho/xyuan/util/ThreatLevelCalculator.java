@@ -8,19 +8,21 @@ import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
-import net.minecraft.registry.RegistryKey;
+import net.minecraft.registry.Registries;
 import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.registry.tag.ItemTags;
 
 import java.util.Map;
 
 /**
- * 威胁等级计算器：按 /workspace/threat-level-spec.txt 规范评估玩家装备威胁等级。
+ * 威胁等级计算器：按 v2 规范评估玩家装备威胁等级。
  *
- * <p>四维度加权：护甲防御分(3.5) + 护甲附魔分(3.5) + 武器攻击分(2.0) + 保命分(1.0)，总分 0.0~10.0。
- * 输出梯队 S/A/B/C/D/F 与胸甲显示名。所有读取在调用线程同步执行，调用方需自行确保非主线程或可接受主线程开销。</p>
+ * <p>v2 权重体系：护甲防御(4.0) + 护甲附魔(4.5) + 保命能力(1.5) 构成基础分(封顶10.0)，
+ * 武器作为附加分(+1.0) 叠加后得到最终分(最高11.0)。
+ * 输出梯队 S+/S/A/B/C/D/F 与胸甲显示名。所有读取在调用线程同步执行。</p>
  *
- * <p>1.21.2+ 工具类被移除，改用 {@link ItemTags} 标签判断武器类型。</p>
+ * <p>1.21.2+ 工具类被移除，改用 {@link ItemTags} 标签判断武器类型。
+ * v2 新增重锤(Mace)、矛(Spear，1.21.11+)、S+ 等级，细化武器材质分档与附魔互斥规则。</p>
  */
 public final class ThreatLevelCalculator {
 
@@ -37,14 +39,16 @@ public final class ThreatLevelCalculator {
     private ThreatLevelCalculator() {
     }
 
-    /** 各部位满分占比（按 spec.txt 1.1）。 */
-    private static final double HELMET_MAX = 0.525;
-    private static final double CHESTPLATE_MAX = 1.400;
-    private static final double LEGGINGS_MAX = 1.050;
-    private static final double BOOTS_MAX = 0.525;
-    private static final double ARMOR_DEFENSE_CAP = 3.5;
+    // ---------- 护甲防御分（v2 满分 4.0） ----------
 
-    /** 各材质各部位护甲值速查（按 spec.txt 1.2，钻石为基准）。 */
+    /** 各部位满分占比（v2：头盔15% 胸甲40% 护腿30% 靴子15%）。 */
+    private static final double HELMET_MAX = 0.600;
+    private static final double CHESTPLATE_MAX = 1.600;
+    private static final double LEGGINGS_MAX = 1.200;
+    private static final double BOOTS_MAX = 0.600;
+    private static final double ARMOR_DEFENSE_CAP = 4.0;
+
+    /** 各材质各部位护甲值速查（按原版数据，钻石为基准）。 */
     private static int armorValue(Item item, EquipmentSlot slot) {
         return switch (slot) {
             case HEAD -> {
@@ -69,7 +73,8 @@ public final class ThreatLevelCalculator {
                 yield 0;
             }
             case FEET -> {
-                if (item == Items.NETHERITE_BOOTS || item == Items.DIAMOND_BOOTS || item == Items.IRON_BOOTS) yield 3;
+                if (item == Items.NETHERITE_BOOTS || item == Items.DIAMOND_BOOTS) yield 3;
+                if (item == Items.IRON_BOOTS) yield 2;
                 if (item == Items.CHAINMAIL_BOOTS || item == Items.GOLDEN_BOOTS || item == Items.LEATHER_BOOTS) yield 1;
                 yield 0;
             }
@@ -120,12 +125,12 @@ public final class ThreatLevelCalculator {
         return score;
     }
 
-    // ---------- 护甲附魔分 ----------
+    // ---------- 护甲附魔分（v2 满分 4.5） ----------
 
-    private static final double PROTECTION_PER_LEVEL = 0.219;
-    private static final double ELEMENTAL_PROTECTION_PER_LEVEL = 0.131;
-    private static final double FEATHER_FALLING_PER_LEVEL = 0.088;
-    private static final double ARMOR_ENCHANT_CAP = 3.5;
+    private static final double PROTECTION_PER_LEVEL = 0.281;
+    private static final double ELEMENTAL_PROTECTION_PER_LEVEL = 0.16875;
+    private static final double FEATHER_FALLING_PER_LEVEL = 0.1125;
+    private static final double ARMOR_ENCHANT_CAP = 4.5;
 
     /** 单件护甲附魔得分：取最高保护类附魔，靴子可叠加摔落保护。 */
     private static double armorEnchantScore(ItemStack stack, EquipmentSlot slot) {
@@ -163,56 +168,83 @@ public final class ThreatLevelCalculator {
         return slot == EquipmentSlot.FEET ? (bestProtection + featherFalling) : bestProtection;
     }
 
-    // ---------- 武器攻击分 ----------
+    // ---------- 武器附加分（v2 附加分 +1.0，基础最高0.60 + 附魔最高0.40） ----------
 
-    private static final double WEAPON_ATTACK_CAP = 2.0;
+    private static final double WEAPON_BONUS_CAP = 1.0;
 
-    /** 武器材质基础分（按 spec.txt 3.1，以下界合金剑 8 伤害 = 1.2 为基准按比例）。 */
+    /** 武器材质基础分（v2：以下界合金剑 0.55 为基准，重锤 0.60 为最高）。 */
     private static double weaponBaseScore(ItemStack stack) {
         if (stack.isEmpty()) {
-            return 0.060; // 徒手
+            return 0.05; // 徒手
         }
         Item item = stack.getItem();
 
-        // 剑类
-        if (item == Items.NETHERITE_SWORD) return 1.200;
-        if (item == Items.DIAMOND_SWORD) return 1.050;
-        if (item == Items.IRON_SWORD) return 0.900;
-        if (item == Items.STONE_SWORD) return 0.750;
-        if (item == Items.WOODEN_SWORD || item == Items.GOLDEN_SWORD) return 0.600;
+        // 重锤（1.21+ 新武器，基础分最高）
+        if (item == Items.MACE) return 0.60;
+
+        // 剑类（v2 材质分档，基于合金剑 0.55 基准）
+        if (item == Items.NETHERITE_SWORD) return 0.55;
+        if (item == Items.DIAMOND_SWORD) return 0.49;
+        if (item == Items.IRON_SWORD) return 0.42;
+        if (item == Items.STONE_SWORD) return 0.35;
+        if (item == Items.WOODEN_SWORD || item == Items.GOLDEN_SWORD) return 0.28;
 
         // 斧类
-        if (item == Items.NETHERITE_AXE) return 1.350;
-        if (item == Items.DIAMOND_AXE || item == Items.IRON_AXE || item == Items.STONE_AXE) return 1.215;
-        if (item == Items.WOODEN_AXE || item == Items.GOLDEN_AXE) return 0.945;
+        if (item == Items.NETHERITE_AXE) return 0.52;
+        if (item == Items.DIAMOND_AXE) return 0.47;
+        if (item == Items.IRON_AXE) return 0.43;
+        if (item == Items.STONE_AXE) return 0.40;
+        if (item == Items.WOODEN_AXE || item == Items.GOLDEN_AXE) return 0.37;
 
-        // 三叉戟
-        if (item == Items.TRIDENT) return 0.975;
+        // 三叉戟（v2 基础分 0.55）
+        if (item == Items.TRIDENT) return 0.55;
 
         // 镐类
-        if (item == Items.NETHERITE_PICKAXE) return 0.630;
-        if (item == Items.DIAMOND_PICKAXE) return 0.525;
-        if (item == Items.IRON_PICKAXE) return 0.420;
-        if (item == Items.STONE_PICKAXE) return 0.315;
-        if (item == Items.WOODEN_PICKAXE || item == Items.GOLDEN_PICKAXE) return 0.210;
+        if (item == Items.NETHERITE_PICKAXE) return 0.26;
+        if (item == Items.DIAMOND_PICKAXE) return 0.22;
+        if (item == Items.IRON_PICKAXE) return 0.17;
+        if (item == Items.STONE_PICKAXE) return 0.13;
+        if (item == Items.WOODEN_PICKAXE || item == Items.GOLDEN_PICKAXE) return 0.09;
 
         // 锹类
-        if (item == Items.NETHERITE_SHOVEL) return 0.585;
-        if (item == Items.DIAMOND_SHOVEL) return 0.495;
-        if (item == Items.IRON_SHOVEL) return 0.405;
-        if (item == Items.STONE_SHOVEL) return 0.315;
-        if (item == Items.WOODEN_SHOVEL || item == Items.GOLDEN_SHOVEL) return 0.225;
+        if (item == Items.NETHERITE_SHOVEL) return 0.26;
+        if (item == Items.DIAMOND_SHOVEL) return 0.20;
+        if (item == Items.IRON_SHOVEL) return 0.17;
+        if (item == Items.STONE_SHOVEL) return 0.13;
+        if (item == Items.WOODEN_SHOVEL || item == Items.GOLDEN_SHOVEL) return 0.09;
 
         // 弓/弩
-        if (item == Items.BOW || item == Items.CROSSBOW) return 0.500;
+        if (item == Items.BOW || item == Items.CROSSBOW) return 0.25;
+
+        // 矛类（1.21.11+ 或模组添加）：按注册名匹配材质分档
+        String itemPath = itemRegistryPath(item);
+        if (itemPath.contains("spear")) {
+            if (itemPath.contains("netherite")) return 0.37;
+            if (itemPath.contains("diamond")) return 0.30;
+            if (itemPath.contains("iron")) return 0.22;
+            if (itemPath.contains("stone") || itemPath.contains("copper")) return 0.15;
+            return 0.08; // 木/金/其他
+        }
+
+        // 锄类（任意锄 0.03）
+        if (itemPath.contains("hoe")) return 0.03;
 
         // 其他物品按标签兜底（用 ItemStack.isIn 避免 getRegistryEntry 弃用）
-        if (isInTag(stack, ItemTags.SWORDS)) return 0.600;
-        if (isInTag(stack, ItemTags.AXES)) return 0.945;
-        if (isInTag(stack, ItemTags.PICKAXES)) return 0.210;
-        if (isInTag(stack, ItemTags.SHOVELS)) return 0.225;
+        if (isInTag(stack, ItemTags.SWORDS)) return 0.28;
+        if (isInTag(stack, ItemTags.AXES)) return 0.37;
+        if (isInTag(stack, ItemTags.PICKAXES)) return 0.09;
+        if (isInTag(stack, ItemTags.SHOVELS)) return 0.09;
 
-        return 0.060; // 徒手 / 其他
+        return 0.05; // 徒手 / 其他
+    }
+
+    /** 获取物品注册路径名（如 "netherite_sword"），异常时返回空串。 */
+    private static String itemRegistryPath(Item item) {
+        try {
+            return Registries.ITEM.getId(item).getPath();
+        } catch (Throwable ignored) {
+            return "";
+        }
     }
 
     /** 安全的标签判断（用 ItemStack.isIn，异常时返回 false）。 */
@@ -224,7 +256,13 @@ public final class ThreatLevelCalculator {
         }
     }
 
-    /** 武器附魔分：锋利类互斥取最高 + 火焰附加可叠加。 */
+    /**
+     * 武器附魔分（v2 最高 0.40）：
+     * 锋利类互斥取最高 + 火焰附加 + 横扫之刃（剑）；
+     * 致密/破甲互斥取最高 + 风爆可叠加（重锤）；
+     * 穿刺 + 激流/忠诚/引雷（三叉戟，激流与忠诚/引雷互斥）；
+     * 突进（矛）。
+     */
     private static double weaponEnchantScore(ItemStack stack) {
         if (stack.isEmpty()) {
             return 0.0;
@@ -234,8 +272,16 @@ public final class ThreatLevelCalculator {
             return 0.0;
         }
 
-        double bestSharpness = 0.0;
-        double fireAspect = 0.0;
+        double bestSharpness = 0.0;    // 锋利/亡灵/节肢 互斥取最高
+        double fireAspect = 0.0;       // 火焰附加
+        double sweeping = 0.0;         // 横扫之刃
+        double bestMaceMutual = 0.0;   // 致密/破甲 互斥取最高
+        double windBurst = 0.0;        // 风爆（可叠加）
+        double rush = 0.0;             // 突进（矛）
+        double impaling = 0.0;         // 穿刺（三叉戟）
+        double riptide = 0.0;          // 激流（三叉戟）
+        double loyalty = 0.0;          // 忠诚（三叉戟）
+        double channeling = 0.0;       // 引雷（三叉戟）
 
         for (Map.Entry<RegistryEntry<Enchantment>, Integer> entry : enchants.getEnchantmentEntries()) {
             String key = enchantKeyId(entry.getKey());
@@ -243,27 +289,46 @@ public final class ThreatLevelCalculator {
             if (level <= 0) continue;
 
             switch (key) {
-                case "sharpness" -> bestSharpness = Math.max(bestSharpness, 0.16 * level);
-                case "smite", "bane_of_arthropods" -> bestSharpness = Math.max(bestSharpness, 0.08 * level);
-                case "fire_aspect" -> {
-                    if (level == 1) fireAspect = 0.11;
-                    else if (level == 2) fireAspect = 0.21;
-                }
+                // 锋利类互斥（三选一）
+                case "sharpness" -> bestSharpness = Math.max(bestSharpness, 0.06 * level);
+                case "smite", "bane_of_arthropods" -> bestSharpness = Math.max(bestSharpness, 0.03 * level);
+                // 火焰附加（剑/重锤通用）
+                case "fire_aspect" -> fireAspect = Math.max(fireAspect, 0.05 * level);
+                // 横扫之刃（剑）
+                case "sweeping_edge" -> sweeping = Math.max(sweeping, 0.025 * level);
+                // 重锤附魔：致密/破甲互斥
+                case "density" -> bestMaceMutual = Math.max(bestMaceMutual, 0.06 * level);
+                case "breach" -> bestMaceMutual = Math.max(bestMaceMutual, 0.05 * level);
+                // 风爆（重锤，可叠加）
+                case "wind_burst" -> windBurst = Math.max(windBurst, 0.05 * level);
+                // 突进（矛）
+                case "rush" -> rush = Math.max(rush, 0.05 * level);
+                // 三叉戟附魔
+                case "impaling" -> impaling = Math.max(impaling, 0.05 * level);
+                case "riptide" -> riptide = Math.max(riptide, 0.033 * level);
+                case "loyalty" -> loyalty = Math.max(loyalty, 0.017 * level);
+                case "channeling" -> channeling = Math.max(channeling, 0.05 * level);
                 default -> { /* 忽略其他附魔 */ }
             }
         }
 
-        return bestSharpness + fireAspect;
+        // 激流与忠诚/引雷互斥：有激流时忽略忠诚和引雷
+        double tridentBonus = impaling + riptide;
+        if (riptide <= 0) {
+            tridentBonus += loyalty + channeling;
+        }
+
+        return bestSharpness + fireAspect + sweeping + bestMaceMutual + windBurst + rush + tridentBonus;
     }
 
-    // ---------- 保命分 ----------
+    // ---------- 保命分（v2 满分 1.5） ----------
 
-    /** 保命分：副手图腾 1.0 / 主手图腾 0.5 / 无 0.0。 */
+    /** 保命分：副手图腾 1.5 / 仅主手图腾 0.75 / 无 0.0。 */
     private static double survivalScore(ItemStack mainHand, ItemStack offHand) {
         boolean offTotem = !offHand.isEmpty() && offHand.getItem() == Items.TOTEM_OF_UNDYING;
         boolean mainTotem = !mainHand.isEmpty() && mainHand.getItem() == Items.TOTEM_OF_UNDYING;
-        if (offTotem) return 1.0;
-        if (mainTotem) return 0.5;
+        if (offTotem) return 1.5;
+        if (mainTotem) return 0.75;
         return 0.0;
     }
 
@@ -281,40 +346,42 @@ public final class ThreatLevelCalculator {
         // 鞘翅特殊处理
         boolean isElytra = !chestplate.isEmpty() && chestplate.getItem() == Items.ELYTRA;
 
-        // 1. 护甲防御分
+        // 1. 护甲防御分（v2 封顶 4.0）
         double armorDefense = armorDefenseScore(helmet, EquipmentSlot.HEAD)
                 + (isElytra ? 0.0 : armorDefenseScore(chestplate, EquipmentSlot.CHEST))
                 + armorDefenseScore(leggings, EquipmentSlot.LEGS)
                 + armorDefenseScore(boots, EquipmentSlot.FEET);
         armorDefense = Math.min(armorDefense, ARMOR_DEFENSE_CAP);
 
-        // 2. 护甲附魔分
+        // 2. 护甲附魔分（v2 封顶 4.5）
         double armorEnchant = armorEnchantScore(helmet, EquipmentSlot.HEAD)
                 + armorEnchantScore(chestplate, EquipmentSlot.CHEST)
                 + armorEnchantScore(leggings, EquipmentSlot.LEGS)
                 + armorEnchantScore(boots, EquipmentSlot.FEET);
         armorEnchant = Math.min(armorEnchant, ARMOR_ENCHANT_CAP);
 
-        // 3. 武器攻击分（主手图腾时为 0）
-        boolean mainIsTotem = !mainHand.isEmpty() && mainHand.getItem() == Items.TOTEM_OF_UNDYING;
-        double weaponAttack = mainIsTotem ? 0.0
-                : Math.min(weaponBaseScore(mainHand) + weaponEnchantScore(mainHand), WEAPON_ATTACK_CAP);
-
-        // 4. 保命分
+        // 3. 保命分（v2：副手图腾 1.5 / 主手图腾 0.75 / 无 0.0）
         double survival = survivalScore(mainHand, offHand);
 
-        // 5. 总分
-        double total = Math.min(armorDefense + armorEnchant + weaponAttack + survival, 10.0);
-        String tier = tierOf(total);
+        // 4. 武器附加分（v2：主手图腾时为 0，否则 base+enchant 封顶 1.0）
+        boolean mainIsTotem = !mainHand.isEmpty() && mainHand.getItem() == Items.TOTEM_OF_UNDYING;
+        double weaponBonus = mainIsTotem ? 0.0
+                : Math.min(weaponBaseScore(mainHand) + weaponEnchantScore(mainHand), WEAPON_BONUS_CAP);
+
+        // 5. 总分（v2 公式：基础分封顶 10.0 + 武器附加分，可突破 10.0 达到 S+）
+        double baseTotal = Math.min(armorDefense + armorEnchant + survival, 10.0);
+        double finalTotal = baseTotal + weaponBonus;
+        String tier = tierOf(finalTotal);
 
         String chestName = chestplateName(chestplate, isElytra);
         String details = buildDetails(helmet, chestplate, leggings, boots, mainHand, offHand, isElytra);
 
-        return new ThreatResult(total, tier, chestName, details, isElytra);
+        return new ThreatResult(finalTotal, tier, chestName, details, isElytra);
     }
 
-    /** 梯队映射。 */
+    /** 梯队映射（v2 新增 S+：> 10.1）。 */
     private static String tierOf(double score) {
+        if (score > 10.1) return "S+";
         if (score >= 9.0) return "S";
         if (score >= 7.0) return "A";
         if (score >= 5.0) return "B";
@@ -348,7 +415,7 @@ public final class ThreatLevelCalculator {
                 + "副手:" + itemName(offHand);
     }
 
-    /** 物品中文名（仅常见装备/武器，其他返回物品键名）。 */
+    /** 物品中文名（仅常见装备/武器，其他返回注册路径名）。 */
     private static String itemName(ItemStack stack) {
         if (stack.isEmpty()) return "无";
         Item item = stack.getItem();
@@ -387,6 +454,7 @@ public final class ThreatLevelCalculator {
         if (item == Items.ELYTRA) return "鞘翅";
         if (item == Items.TOTEM_OF_UNDYING) return "不死图腾";
         if (item == Items.TRIDENT) return "三叉戟";
+        if (item == Items.MACE) return "重锤";
         if (item == Items.BOW) return "弓";
         if (item == Items.CROSSBOW) return "弩";
         if (item == Items.SHIELD) return "盾牌";
@@ -394,8 +462,9 @@ public final class ThreatLevelCalculator {
         if (item == Items.STONE_AXE) return "石斧";
         if (item == Items.WOODEN_SWORD) return "木剑";
         if (item == Items.WOODEN_AXE) return "木斧";
-        // 兜底：用注册表 ID
-        return item.toString();
+        // 兜底：用注册表路径名
+        String path = itemRegistryPath(item);
+        return path.isEmpty() ? item.toString() : path;
     }
 
     /** 附魔摘要，如 " [保护 IV, 摔落保护 IV]"。无附魔返回空字符串。 */
@@ -439,6 +508,15 @@ public final class ThreatLevelCalculator {
             case "smite" -> "亡灵杀手";
             case "bane_of_arthropods" -> "节肢杀手";
             case "fire_aspect" -> "火焰附加";
+            case "sweeping_edge" -> "横扫之刃";
+            case "density" -> "致密";
+            case "breach" -> "破甲";
+            case "wind_burst" -> "风爆";
+            case "rush" -> "突进";
+            case "impaling" -> "穿刺";
+            case "riptide" -> "激流";
+            case "loyalty" -> "忠诚";
+            case "channeling" -> "引雷";
             case "unbreaking" -> "耐久";
             case "mending" -> "经验修补";
             case "thorns" -> "荆棘";
@@ -448,6 +526,13 @@ public final class ThreatLevelCalculator {
             case "frost_walker" -> "冰霜行者";
             case "soul_speed" -> "灵魂疾行";
             case "swift_sneak" -> "迅捷潜行";
+            case "power" -> "力量";
+            case "punch" -> "冲击";
+            case "flame" -> "火矢";
+            case "infinity" -> "无限";
+            case "multishot" -> "多重射击";
+            case "quick_charge" -> "快速装填";
+            case "piercing" -> "穿透";
             default -> key;
         };
     }

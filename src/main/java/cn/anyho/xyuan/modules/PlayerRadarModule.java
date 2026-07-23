@@ -10,6 +10,7 @@ import meteordevelopment.meteorclient.settings.EnumSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
+import meteordevelopment.meteorclient.settings.StringListSetting;
 import meteordevelopment.meteorclient.settings.StringSetting;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
@@ -19,6 +20,7 @@ import net.minecraft.entity.player.PlayerEntity;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -48,7 +50,8 @@ public class PlayerRadarModule extends Module {
         C,
         B,
         A,
-        S;
+        S,
+        S_PLUS;
 
         /** 梯队序号（越大威胁越高），用于过滤比较。 */
         public int rank() {
@@ -63,7 +66,8 @@ public class PlayerRadarModule extends Module {
                 case C -> "C及以上";
                 case B -> "B及以上";
                 case A -> "A及以上";
-                case S -> "仅S";
+                case S -> "S及以上";
+                case S_PLUS -> "仅S+";
             };
         }
     }
@@ -75,7 +79,7 @@ public class PlayerRadarModule extends Module {
     private static final String DEFAULT_HISTORY_FILE = "logs/player-radar-history.log";
 
     /** 每条通知最多显示的玩家数（防止超出飞书 Webhook 消息大小限制）。 */
-    private static final int MAX_DISPLAY_PLAYERS = 10;
+    private static final int MAX_DISPLAY_PLAYERS = 15;
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgNotify = settings.createGroup("通知类型");
@@ -133,6 +137,13 @@ public class PlayerRadarModule extends Module {
             .build()
     );
 
+    private final Setting<Boolean> verboseInfo = sgNotify.add(new BoolSetting.Builder()
+            .name("附加信息标题")
+            .description("开启时显示完整附加信息（如 距离米,已停留:xx,胸甲:xx, 威胁等级:xx）；关闭时使用简短格式（如 距离米, xx, xx, xx）。")
+            .defaultValue(true)
+            .build()
+    );
+
     // ---------- 过滤规则 ----------
 
     private final Setting<Boolean> ignoreFriends = sgFilter.add(new BoolSetting.Builder()
@@ -142,11 +153,10 @@ public class PlayerRadarModule extends Module {
             .build()
     );
 
-    private final Setting<String> whitelist = sgFilter.add(new StringSetting.Builder()
+    private final Setting<List<String>> whitelist = sgFilter.add(new StringListSetting.Builder()
             .name("自定义白名单")
-            .description("不触发通知的玩家名列表，逗号分隔（如 玩家1,玩家2）。不区分大小写。")
-            .defaultValue("")
-            .wide()
+            .description("不触发通知的玩家名列表。不区分大小写。")
+            .defaultValue(new ArrayList<>())
             .build()
     );
 
@@ -222,9 +232,10 @@ public class PlayerRadarModule extends Module {
     private final Map<UUID, ThreatResult> cachedThreats = new HashMap<>();
     /** 进入时间戳（毫秒），用于计算持续时长。 */
     private final Map<UUID, Long> enterTimeMs = new HashMap<>();
-    /** 上一 tick 缓存的玩家名与最后距离，供离开通知使用（实体已不在时仍可读名）。 */
+    /** 上一 tick 缓存的玩家名、最后距离与血量，供离开通知使用（实体已不在时仍可读）。 */
     private final Map<UUID, String> cachedNames = new HashMap<>();
     private final Map<UUID, Double> cachedLastDistance = new HashMap<>();
+    private final Map<UUID, Float> cachedHealth = new HashMap<>();
     private long lastPollMs;
 
     private PlayerRadarHistory history;
@@ -240,6 +251,7 @@ public class PlayerRadarModule extends Module {
         enterTimeMs.clear();
         cachedNames.clear();
         cachedLastDistance.clear();
+        cachedHealth.clear();
         lastPollMs = 0;
         playerName = null;
         capturePlayerName();
@@ -263,6 +275,7 @@ public class PlayerRadarModule extends Module {
         enterTimeMs.clear();
         cachedNames.clear();
         cachedLastDistance.clear();
+        cachedHealth.clear();
     }
 
     // ---------- 事件监听 ----------
@@ -279,6 +292,7 @@ public class PlayerRadarModule extends Module {
         Map<UUID, PlayerEntity> strangerEntities = new HashMap<>();
         Map<UUID, Double> currentDistances = new HashMap<>();
         Map<UUID, String> currentNames = new HashMap<>();
+        Map<UUID, Float> currentHealth = new HashMap<>();
 
         try {
             List<? extends PlayerEntity> players = mc.world.getPlayers();
@@ -303,6 +317,7 @@ public class PlayerRadarModule extends Module {
                 strangerEntities.put(uuid, player);
                 currentDistances.put(uuid, Math.sqrt(distSq));
                 currentNames.put(uuid, player.getName().getString());
+                currentHealth.put(uuid, player.getHealth());
             }
         } catch (Throwable t) {
             // 扫描阶段异常：记录日志但不中断后续缓存更新
@@ -347,7 +362,7 @@ public class PlayerRadarModule extends Module {
                 enterTimeMs.put(uuid, now);
                 double distance = currentDistances.getOrDefault(uuid, 0.0);
                 String name = currentNames.getOrDefault(uuid, "unknown");
-                infos.add(new StrangerInfo(name, uuid, distance, threat));
+                infos.add(new StrangerInfo(name, distance, 0L, threat));
                 if (history != null && threat != null) {
                     try {
                         history.recordEnter(name, distance, entity.getHealth(), threat);
@@ -356,6 +371,7 @@ public class PlayerRadarModule extends Module {
                 }
             }
             if (!infos.isEmpty()) {
+                infos.sort(Comparator.comparingDouble(i -> i.distance));
                 sendMarkdown(buildEnterMarkdown(infos));
             }
         }
@@ -366,21 +382,24 @@ public class PlayerRadarModule extends Module {
                 Long enterMs = enterTimeMs.remove(uuid);
                 long durationSec = enterMs == null ? 0 : (now - enterMs) / 1000;
                 ThreatResult cached = cachedThreats.remove(uuid);
-                // 离开时实体已不在，从上一 tick 缓存读取玩家名与最后距离
+                // 离开时实体已不在，从上一 tick 缓存读取玩家名、最后距离与血量
                 String name = cachedNames.getOrDefault(uuid, "unknown");
                 double lastDist = cachedLastDistance.getOrDefault(uuid, 0.0);
-                infos.add(new LeaveInfo(name, uuid, lastDist, durationSec, cached));
+                float lastHealth = cachedHealth.getOrDefault(uuid, 0f);
+                infos.add(new LeaveInfo(name, lastDist, durationSec, cached));
                 if (history != null && cached != null) {
                     try {
-                        history.recordLeave(name, lastDist, durationSec, 0f, cached);
+                        history.recordLeave(name, lastDist, durationSec, lastHealth, cached);
                     } catch (Throwable ignored) {
                     }
                 }
             }
+            infos.sort(Comparator.comparingDouble(i -> i.lastDistance));
             sendMarkdown(buildLeaveMarkdown(infos));
         }
 
         // ---------- 定时轨：快照 ----------
+        // 计时器持续运行，不在无人时重置，避免玩家频繁进出渲染边界导致周期被不断打断
         if (enableSnapshot.get() && !currentStrangers.isEmpty()) {
             long periodMs = pollPeriod.get() * 1000L;
             if (now - lastPollMs >= periodMs) {
@@ -404,15 +423,15 @@ public class PlayerRadarModule extends Module {
                     }
                     double distance = currentDistances.getOrDefault(uuid, 0.0);
                     String name = currentNames.getOrDefault(uuid, "unknown");
-                    infos.add(new StrangerInfo(name, uuid, distance, threat));
+                    long enterMs = enterTimeMs.getOrDefault(uuid, now);
+                    long staySec = (now - enterMs) / 1000;
+                    infos.add(new StrangerInfo(name, distance, staySec, threat));
                 }
                 if (!infos.isEmpty()) {
+                    infos.sort(Comparator.comparingDouble(i -> i.distance));
                     sendMarkdown(buildSnapshotMarkdown(infos));
                 }
             }
-        } else if (currentStrangers.isEmpty()) {
-            // 无陌生人时重置计时，避免下次有人时立即触发（等满一个周期）
-            lastPollMs = now;
         }
 
         // 更新上一 tick 缓存
@@ -422,6 +441,8 @@ public class PlayerRadarModule extends Module {
         cachedNames.putAll(currentNames);
         cachedLastDistance.clear();
         cachedLastDistance.putAll(currentDistances);
+        cachedHealth.clear();
+        cachedHealth.putAll(currentHealth);
     }
 
     // ---------- 过滤逻辑 ----------
@@ -458,14 +479,12 @@ public class PlayerRadarModule extends Module {
 
     /** 判断玩家名是否在自定义白名单中（不区分大小写）。 */
     private boolean isInWhitelist(String name) {
-        String list = whitelist.get();
-        if (list == null || list.isBlank()) {
+        List<String> list = whitelist.get();
+        if (list == null || list.isEmpty()) {
             return false;
         }
-        String[] names = list.split(",");
-        for (String n : names) {
-            String trimmed = n.trim();
-            if (!trimmed.isEmpty() && trimmed.equalsIgnoreCase(name)) {
+        for (String n : list) {
+            if (n != null && !n.isBlank() && n.trim().equalsIgnoreCase(name)) {
                 return true;
             }
         }
@@ -479,7 +498,9 @@ public class PlayerRadarModule extends Module {
             return false;
         }
         try {
-            ThreatTier playerTier = ThreatTier.valueOf(tier);
+            // "S+" → S_PLUS 枚举名映射
+            String enumName = "S+".equals(tier) ? "S_PLUS" : tier;
+            ThreatTier playerTier = ThreatTier.valueOf(enumName);
             return playerTier.rank() < min.rank();
         } catch (IllegalArgumentException ignored) {
             return false; // 未知梯队默认放行
@@ -488,22 +509,60 @@ public class PlayerRadarModule extends Module {
 
     // ---------- Markdown 构造 ----------
 
-    /** 单个陌生人信息。 */
-    private record StrangerInfo(String name, UUID uuid, double distance, ThreatResult threat) {
+    /** 单个陌生人信息。staySec 为在视野内已停留秒数（进入通知为 0）。 */
+    private record StrangerInfo(String name, double distance, long staySec, ThreatResult threat) {
     }
 
     /** 离开信息。 */
-    private record LeaveInfo(String name, UUID uuid, double lastDistance, long durationSec, ThreatResult cachedThreat) {
+    private record LeaveInfo(String name, double lastDistance, long durationSec, ThreatResult cachedThreat) {
     }
 
-    /** 构造玩家行：name(距离米, 胸甲:xx, 威胁等级:xx)。 */
-    private String formatPlayerLine(StrangerInfo info) {
-        String line = info.name + "(" + String.format("%.1f", info.distance) + "米";
-        if (info.threat != null) {
-            line += ", 胸甲:" + info.threat.chestplateName();
-            line += ", 威胁等级:" + info.threat.tier();
+    /**
+     * 构造玩家行（用于进入/快照通知）。
+     * <p>verboseInfo=true：
+     * <ul>
+     *   <li>showStay=true（快照）：name(距离米, 已停留:xx, 胸甲:xx, 威胁等级:xx)</li>
+     *   <li>showStay=false（进入）：name(距离米, 胸甲:xx, 威胁等级:xx)</li>
+     * </ul>
+     * <p>verboseInfo=false：
+     * <ul>
+     *   <li>showStay=true（快照）：name(距离米, xx, xx, xx)</li>
+     *   <li>showStay=false（进入）：name(距离米, xx, xx)</li>
+     * </ul>
+     */
+    private String formatPlayerLine(StrangerInfo info, boolean showStay) {
+        if (verboseInfo.get()) {
+            String line = info.name + "(" + String.format("%.1f", info.distance) + "米";
+            if (showStay) {
+                line += ", 已停留:" + formatStayDuration(info.staySec);
+            }
+            if (info.threat != null) {
+                line += ", 胸甲:" + info.threat.chestplateName();
+                line += ", 威胁等级:" + info.threat.tier();
+            }
+            return line + ")";
+        } else {
+            String line = info.name + "(" + String.format("%.1f", info.distance) + "米";
+            if (showStay) {
+                line += ", " + formatStayDuration(info.staySec);
+            }
+            if (info.threat != null) {
+                line += ", " + info.threat.chestplateName();
+                line += ", " + info.threat.tier();
+            }
+            return line + ")";
         }
-        return line + ")";
+    }
+
+    /** 停留时长格式化：100h / 10h / 10m / 10s。 */
+    private String formatStayDuration(long seconds) {
+        if (seconds >= 3600) {
+            return (seconds / 3600) + "h";
+        }
+        if (seconds >= 60) {
+            return (seconds / 60) + "m";
+        }
+        return seconds + "s";
     }
 
     /** 构造通用 Markdown 头（标题 + 本地玩家 + 触发时间 + 总计）。 */
@@ -520,18 +579,12 @@ public class PlayerRadarModule extends Module {
     private String buildEnterMarkdown(List<StrangerInfo> infos) {
         StringBuilder sb = new StringBuilder(buildHeader("[预警]非好友玩家进入视野", infos.size()));
         int showCount = Math.min(infos.size(), MAX_DISPLAY_PLAYERS);
+        sb.append("\n进入玩家:");
+        for (int i = 0; i < showCount; i++) {
+            sb.append("\n").append(formatPlayerLine(infos.get(i), false));
+        }
         if (infos.size() > MAX_DISPLAY_PLAYERS) {
-            // 玩家过多：用紧凑格式（玩家名+UUID）防止超出飞书 Webhook 字节限制
-            sb.append("\n玩家id:");
-            for (int i = 0; i < showCount; i++) {
-                StrangerInfo info = infos.get(i);
-                sb.append("\n").append(info.name()).append("(").append(info.uuid()).append(")");
-            }
-            sb.append("\n…等").append(infos.size()).append("名玩家");
-        } else {
-            for (StrangerInfo info : infos) {
-                sb.append("\n进入玩家:").append(formatPlayerLine(info));
-            }
+            sb.append("\n…等等");
         }
         return sb.toString();
     }
@@ -539,43 +592,43 @@ public class PlayerRadarModule extends Module {
     private String buildLeaveMarkdown(List<LeaveInfo> infos) {
         StringBuilder sb = new StringBuilder(buildHeader("[预警]非好友玩家离开视野", infos.size()));
         int showCount = Math.min(infos.size(), MAX_DISPLAY_PLAYERS);
+        sb.append("\n离开玩家:");
+        for (int i = 0; i < showCount; i++) {
+            sb.append("\n").append(formatLeaveLine(infos.get(i)));
+        }
         if (infos.size() > MAX_DISPLAY_PLAYERS) {
-            // 玩家过多：用紧凑格式（玩家名+UUID）防止超出飞书 Webhook 字节限制
-            sb.append("\n玩家id:");
-            for (int i = 0; i < showCount; i++) {
-                LeaveInfo info = infos.get(i);
-                sb.append("\n").append(info.name()).append("(").append(info.uuid()).append(")");
-            }
-            sb.append("\n…等").append(infos.size()).append("名玩家");
-        } else {
-            for (LeaveInfo info : infos) {
-                String duration = formatDuration(info.durationSec);
-                String tier = info.cachedThreat != null ? info.cachedThreat.tier() : "未知";
-                sb.append("\n离开玩家:").append(info.name)
-                        .append("(最后距离:").append(String.format("%.1f", info.lastDistance)).append("米")
-                        .append(", 持续:").append(duration)
-                        .append(", 威胁等级:").append(tier)
-                        .append(")");
-            }
+            sb.append("\n…等等");
         }
         return sb.toString();
+    }
+
+    /**
+     * 构造离开玩家行。
+     * <p>verboseInfo=true：name(最后距离:xx米, 持续:xx, 威胁等级:xx)
+     * <p>verboseInfo=false：name(距离米, 持续时长, 等级)
+     */
+    private String formatLeaveLine(LeaveInfo info) {
+        String tier = info.cachedThreat != null ? info.cachedThreat.tier() : "未知";
+        if (verboseInfo.get()) {
+            return info.name + "(最后距离:" + String.format("%.1f", info.lastDistance) + "米"
+                    + ", 持续:" + formatDuration(info.durationSec)
+                    + ", 威胁等级:" + tier + ")";
+        } else {
+            return info.name + "(" + String.format("%.1f", info.lastDistance) + "米"
+                    + ", " + formatStayDuration(info.durationSec)
+                    + ", " + tier + ")";
+        }
     }
 
     private String buildSnapshotMarkdown(List<StrangerInfo> infos) {
         StringBuilder sb = new StringBuilder(buildHeader("[预警]附近有非好友玩家", infos.size()));
         int showCount = Math.min(infos.size(), MAX_DISPLAY_PLAYERS);
+        sb.append("\n玩家ID:");
+        for (int i = 0; i < showCount; i++) {
+            sb.append("\n").append(formatPlayerLine(infos.get(i), true));
+        }
         if (infos.size() > MAX_DISPLAY_PLAYERS) {
-            // 玩家过多：用紧凑格式（玩家名+UUID）防止超出飞书 Webhook 字节限制
-            sb.append("\n玩家id:");
-            for (int i = 0; i < showCount; i++) {
-                StrangerInfo info = infos.get(i);
-                sb.append("\n").append(info.name()).append("(").append(info.uuid()).append(")");
-            }
-            sb.append("\n…等").append(infos.size()).append("名玩家");
-        } else {
-            for (StrangerInfo info : infos) {
-                sb.append("\n玩家ID:").append(formatPlayerLine(info));
-            }
+            sb.append("\n…等等");
         }
         return sb.toString();
     }

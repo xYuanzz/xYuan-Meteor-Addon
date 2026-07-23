@@ -161,7 +161,7 @@ public final class PlayerRadarHistory {
                 + "[" + time + "] 离开视野\n"
                 + "----------------------------------------\n"
                 + "玩家: " + playerName + "\n"
-                + "距离: " + String.format("%.1f", lastDistance) + "米 | 持续: " + duration + " | 血量: " + String.format("%.0f", health) + "/20\n"
+                + "距离: " + String.format("%.1f", lastDistance) + "米 | 持续: " + duration + " | 最后血量: " + String.format("%.0f", health) + "/20\n"
                 + "威胁等级: " + threat.tier() + " (" + String.format("%.2f", threat.score()) + "分) [进入时]\n"
                 + "----------------------------------------\n"
                 + "装备详情: (进入时记录)\n"
