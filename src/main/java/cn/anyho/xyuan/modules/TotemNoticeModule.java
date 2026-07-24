@@ -95,7 +95,7 @@ public class TotemNoticeModule extends Module {
     private long lastDeathBroadcastTimeMs;
 
     public TotemNoticeModule() {
-        super(QueueNoticeAddon.CATEGORY, "图腾提醒", "监控不死图腾触发与玩家死亡并通过飞书 Webhook 推送提醒，附带剩余图腾数量与死亡信息。");
+        super(QueueNoticeAddon.CATEGORY, "图腾提醒", "图腾耗尽与死亡时通过飞书Webhook推送提醒。");
     }
 
     @Override

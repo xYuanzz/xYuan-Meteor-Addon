@@ -150,7 +150,7 @@ public class QueueNoticeModule extends Module {
     });
 
     public QueueNoticeModule() {
-        super(QueueNoticeAddon.CATEGORY, "队列提醒", "监控 3c3u.org 服务器队列位置并通过飞书 Webhook 推送排队进度提醒。");
+        super(QueueNoticeAddon.CATEGORY, "队列提醒", "监控3c3u排队进度并通过飞书Webhook推送提醒。");
     }
 
     @Override

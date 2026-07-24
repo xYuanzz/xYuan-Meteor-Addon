@@ -161,7 +161,6 @@ public class PacketDebugModule extends Module {
             .name("类名关键字(白名单)")
             .description("仅记录类名包含任一关键字的数据包，多个关键字用逗号分隔（如 EntityStatus,ChatMessage）。留空 = 不限制。不区分大小写。")
             .defaultValue("")
-            .wide()
             .visible(() -> captureMode.get() == CaptureMode.FILTERED)
             .build()
     );
@@ -172,7 +171,6 @@ public class PacketDebugModule extends Module {
             .name("日志文件路径")
             .description("数据包日志文件路径（相对游戏根目录）。默认 logs/packets-debug.log。")
             .defaultValue(DEFAULT_LOG_FILE)
-            .wide()
             .build()
     );
 

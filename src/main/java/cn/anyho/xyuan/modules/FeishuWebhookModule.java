@@ -18,7 +18,6 @@ public class FeishuWebhookModule extends Module {
             .name("飞书Webhook地址")
             .description("飞书自定义机器人的完整 Webhook 地址。")
             .defaultValue("")
-            .wide()
             .build()
     );
 
@@ -41,13 +40,12 @@ public class FeishuWebhookModule extends Module {
             .name("签名密钥")
             .description("飞书机器人签名密钥，启用签名校验时必填。")
             .defaultValue("")
-            .wide()
             .visible(enableSign::get)
             .build()
     );
 
     public FeishuWebhookModule() {
-        super(QueueNoticeAddon.CATEGORY, "飞书Webhook", "集中管理飞书自定义机器人 Webhook 配置，供其他提醒模块共用。");
+        super(QueueNoticeAddon.CATEGORY, "飞书Webhook", "集中管理飞书Webhook配置，供其他模块共用。");
     }
 
     /** 异步推送 Markdown 内容到飞书 Webhook。地址为空时静默跳过。 */

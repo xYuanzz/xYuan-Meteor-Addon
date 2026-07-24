@@ -210,7 +210,6 @@ public class PlayerRadarModule extends Module {
             .name("历史记录文件路径")
             .description("历史记录文件路径（相对游戏根目录）。")
             .defaultValue(DEFAULT_HISTORY_FILE)
-            .wide()
             .visible(enableHistory::get)
             .build()
     );
@@ -241,7 +240,7 @@ public class PlayerRadarModule extends Module {
     private PlayerRadarHistory history;
 
     public PlayerRadarModule() {
-        super(QueueNoticeAddon.CATEGORY, "附近玩家预警", "扫描附近陌生玩家并通过飞书 Webhook 推送提醒，含威胁等级评估与历史记录。");
+        super(QueueNoticeAddon.CATEGORY, "玩家预警", "扫描附近陌生玩家并通过飞书Webhook推送提醒。");
     }
 
     @Override
