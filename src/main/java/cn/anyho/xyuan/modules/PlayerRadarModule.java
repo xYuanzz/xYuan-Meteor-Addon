@@ -13,7 +13,6 @@ import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.settings.StringListSetting;
 import meteordevelopment.meteorclient.settings.StringSetting;
 import meteordevelopment.meteorclient.systems.modules.Module;
-import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.entity.player.PlayerEntity;
 
@@ -104,13 +103,6 @@ public class PlayerRadarModule extends Module {
             .defaultValue(2)
             .range(1, 60)
             .sliderRange(1, 30)
-            .build()
-    );
-
-    private final Setting<Boolean> skipServerCheck = sgGeneral.add(new BoolSetting.Builder()
-            .name("不校验服务器地址")
-            .description("跳过 3c3u.org 白名单校验，允许在任意服务器触发预警。")
-            .defaultValue(false)
             .build()
     );
 
@@ -645,7 +637,7 @@ public class PlayerRadarModule extends Module {
     // ---------- 工具方法 ----------
 
     private void sendMarkdown(String markdown) {
-        FeishuWebhookModule webhook = Modules.get().get(FeishuWebhookModule.class);
+        GlobalSettingsModule webhook = GlobalSettingsModule.get();
         if (webhook != null) {
             webhook.sendMarkdown(markdown);
         }
@@ -660,15 +652,9 @@ public class PlayerRadarModule extends Module {
         }
     }
 
-    /** 启用「不校验服务器地址」时返回 false；否则按地址不包含 3c3u.org 判定。 */
+    /** 服务器白名单校验已迁移至「全局设置」模块，此处委托全局配置。模块缺失时保守判定为不在目标服务器。 */
     private boolean isNotOnTargetServer() {
-        if (skipServerCheck.get()) {
-            return false;
-        }
-        if (mc.getCurrentServerEntry() == null) {
-            return true;
-        }
-        String address = mc.getCurrentServerEntry().address;
-        return address == null || !address.toLowerCase().contains("3c3u.org");
+        GlobalSettingsModule global = GlobalSettingsModule.get();
+        return global == null || global.isNotOnTargetServer();
     }
 }

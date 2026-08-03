@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "cn.anyho.xyuan.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "BlockESPMixin",
+    "ESPChunkMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

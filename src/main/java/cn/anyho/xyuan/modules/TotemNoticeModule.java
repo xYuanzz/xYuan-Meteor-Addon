@@ -6,7 +6,6 @@ import meteordevelopment.meteorclient.settings.BoolSetting;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.systems.modules.Module;
-import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.damage.DamageType;
@@ -58,7 +57,6 @@ public class TotemNoticeModule extends Module {
     private static final long DEATH_BROADCAST_WINDOW_MS = 1000;
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
-    private final SettingGroup sgAdvanced = settings.createGroup("高级");
 
     private final Setting<Boolean> urgentWhenEmpty = sgGeneral.add(new BoolSetting.Builder()
             .name("耗尽时紧急提醒")
@@ -71,13 +69,6 @@ public class TotemNoticeModule extends Module {
             .name("启用死亡提醒")
             .description("玩家死亡时推送提醒，携带游戏返回的死亡信息（如「被xxx杀死了」）。")
             .defaultValue(true)
-            .build()
-    );
-
-    private final Setting<Boolean> skipServerCheck = sgAdvanced.add(new BoolSetting.Builder()
-            .name("不校验服务器地址")
-            .description("跳过 3c3u.org 白名单校验，允许在任意服务器触发图腾提醒。")
-            .defaultValue(false)
             .build()
     );
 
@@ -300,7 +291,7 @@ public class TotemNoticeModule extends Module {
 
     /** 构造并发送图腾触发提醒。 */
     private void sendTotemReminder(int remaining, String damageDescription) {
-        FeishuWebhookModule webhook = Modules.get().get(FeishuWebhookModule.class);
+        GlobalSettingsModule webhook = GlobalSettingsModule.get();
         if (webhook != null) {
             webhook.sendMarkdown(buildMarkdown(remaining, damageDescription));
         }
@@ -394,7 +385,7 @@ public class TotemNoticeModule extends Module {
 
     /** 构造并发送玩家死亡提醒。第一行为游戏返回的死亡信息（红色加粗）。 */
     private void sendDeathReminder(String deathMessage, String damageDescription) {
-        FeishuWebhookModule webhook = Modules.get().get(FeishuWebhookModule.class);
+        GlobalSettingsModule webhook = GlobalSettingsModule.get();
         if (webhook != null) {
             webhook.sendMarkdown(buildDeathMarkdown(deathMessage, damageDescription));
         }
@@ -422,15 +413,9 @@ public class TotemNoticeModule extends Module {
         }
     }
 
-    /** 启用「不校验服务器地址」时返回 false；否则按地址不包含 3c3u.org 判定。 */
+    /** 服务器白名单校验已迁移至「全局设置」模块，此处委托全局配置。模块缺失时保守判定为不在目标服务器。 */
     private boolean isNotOnTargetServer() {
-        if (skipServerCheck.get()) {
-            return false;
-        }
-        if (mc.getCurrentServerEntry() == null) {
-            return true;
-        }
-        String address = mc.getCurrentServerEntry().address;
-        return address == null || !address.toLowerCase().contains("3c3u.org");
+        GlobalSettingsModule global = GlobalSettingsModule.get();
+        return global == null || global.isNotOnTargetServer();
     }
 }

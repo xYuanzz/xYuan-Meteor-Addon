@@ -76,7 +76,6 @@ public class PacketDebugModule extends Module {
     private final SettingGroup sgState = settings.createGroup("状态过滤");
     private final SettingGroup sgClassName = settings.createGroup("类名过滤");
     private final SettingGroup sgOutput = settings.createGroup("输出设置");
-    private final SettingGroup sgAdvanced = settings.createGroup("高级");
 
     // ---------- 基础设置 ----------
 
@@ -186,15 +185,6 @@ public class PacketDebugModule extends Module {
     private final Setting<Boolean> clearOnActivate = sgOutput.add(new BoolSetting.Builder()
             .name("启用时清空文件")
             .description("模块启用时清空日志文件，避免历史数据干扰分析。")
-            .defaultValue(true)
-            .build()
-    );
-
-    // ---------- 高级 ----------
-
-    private final Setting<Boolean> skipServerCheck = sgAdvanced.add(new BoolSetting.Builder()
-            .name("不校验服务器地址")
-            .description("跳过 3c3u.org 白名单校验，允许在任意服务器抓取数据包。")
             .defaultValue(true)
             .build()
     );
@@ -396,15 +386,9 @@ public class PacketDebugModule extends Module {
 
     // ---------- 工具方法 ----------
 
-    /** 启用「不校验服务器地址」时返回 false；否则按地址不包含 3c3u.org 判定。 */
+    /** 服务器白名单校验已迁移至「全局设置」模块，此处委托全局配置。模块缺失时保守判定为不在目标服务器。 */
     private boolean isNotOnTargetServer() {
-        if (skipServerCheck.get()) {
-            return false;
-        }
-        if (mc.getCurrentServerEntry() == null) {
-            return true;
-        }
-        String address = mc.getCurrentServerEntry().address;
-        return address == null || !address.toLowerCase().contains("3c3u.org");
+        GlobalSettingsModule global = GlobalSettingsModule.get();
+        return global == null || global.isNotOnTargetServer();
     }
 }

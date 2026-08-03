@@ -12,7 +12,6 @@ import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.systems.modules.Module;
-import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.orbit.EventHandler;
 import meteordevelopment.orbit.EventPriority;
 import net.minecraft.network.packet.Packet;
@@ -52,13 +51,10 @@ public class QueueNoticeModule extends Module {
     private static final DateTimeFormatter TIME_FORMAT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
-    private static final String TARGET_SERVER = "3c3u.org";
-
     /** 退出判定延迟（秒）：此时间内收到 GameJoinedEvent 视为切换子服，否则视为真正退出。 */
     private static final long EXIT_DETECT_DELAY_SECONDS = 5;
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
-    private final SettingGroup sgAdvanced = settings.createGroup("高级");
 
     private final Setting<NotifyMode> notifyMode = sgGeneral.add(new EnumSetting.Builder<NotifyMode>()
             .name("进度通知模式")
@@ -117,13 +113,6 @@ public class QueueNoticeModule extends Module {
             .name("启用异常断开提醒")
             .description("服务器异常断开连接时触发提醒，携带断开时的报错原文。")
             .defaultValue(true)
-            .build()
-    );
-
-    private final Setting<Boolean> skipServerCheck = sgAdvanced.add(new BoolSetting.Builder()
-            .name("不校验服务器地址")
-            .description("跳过 3c3u.org 白名单校验，允许在任意服务器触发排队提醒。")
-            .defaultValue(false)
             .build()
     );
 
@@ -404,9 +393,9 @@ public class QueueNoticeModule extends Module {
         return "<font color=\"red\">**" + value + "**</font>";
     }
 
-    /** 异步推送提醒到飞书 Webhook。不校验 FeishuWebhookModule.isActive()，未启用时设置仍生效。 */
+    /** 异步推送提醒到飞书 Webhook。不校验 GlobalSettingsModule.isActive()，未启用时设置仍生效。 */
     private void sendReminder(String markdownContent) {
-        FeishuWebhookModule webhook = Modules.get().get(FeishuWebhookModule.class);
+        GlobalSettingsModule webhook = GlobalSettingsModule.get();
         if (webhook != null) {
             webhook.sendMarkdown(markdownContent);
         }
@@ -421,16 +410,10 @@ public class QueueNoticeModule extends Module {
         }
     }
 
-    /** 启用「不校验服务器地址」时直接返回 true；否则按地址包含 3c3u.org 判定。 */
+    /** 服务器白名单校验已迁移至「全局设置」模块，此处委托全局配置。模块缺失时保守判定为不在目标服务器。 */
     private boolean isOnTargetServer() {
-        if (skipServerCheck.get()) {
-            return true;
-        }
-        if (mc.getCurrentServerEntry() == null) {
-            return false;
-        }
-        String address = mc.getCurrentServerEntry().address;
-        return address != null && address.toLowerCase().contains(TARGET_SERVER);
+        GlobalSettingsModule global = GlobalSettingsModule.get();
+        return global != null && global.isOnTargetServer();
     }
 
     private void resetQueueState() {

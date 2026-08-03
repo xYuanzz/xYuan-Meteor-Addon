@@ -17,6 +17,9 @@
       "cn.anyho.xyuan.QueueNoticeAddon"
     ]
   },
+  "mixins": [
+    "queue-notice.mixins.json"
+  ],
   "custom": {
     "meteor-client:color": "25,225,225",
     "modmenu": {

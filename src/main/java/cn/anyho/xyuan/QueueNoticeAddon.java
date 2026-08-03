@@ -1,10 +1,13 @@
 package cn.anyho.xyuan;
 
-import cn.anyho.xyuan.modules.FeishuWebhookModule;
+import cn.anyho.xyuan.modules.AutoCommandModule;
+import cn.anyho.xyuan.modules.AutoModuleToggleModule;
+import cn.anyho.xyuan.modules.GlobalSettingsModule;
 import cn.anyho.xyuan.modules.PacketDebugModule;
 import cn.anyho.xyuan.modules.PlayerRadarModule;
 import cn.anyho.xyuan.modules.QueueNoticeModule;
 import cn.anyho.xyuan.modules.TotemNoticeModule;
+import cn.anyho.xyuan.modules.VaultEnhanceModule;
 import com.mojang.logging.LogUtils;
 import meteordevelopment.meteorclient.addons.GithubRepo;
 import meteordevelopment.meteorclient.addons.MeteorAddon;
@@ -31,8 +34,11 @@ public class QueueNoticeAddon extends MeteorAddon {
         Modules.get().add(new QueueNoticeModule());
         Modules.get().add(new TotemNoticeModule());
         Modules.get().add(new PlayerRadarModule());
-        Modules.get().add(new FeishuWebhookModule());
+        Modules.get().add(new AutoCommandModule());
+        Modules.get().add(new AutoModuleToggleModule());
+        Modules.get().add(new GlobalSettingsModule());
         Modules.get().add(new PacketDebugModule());
+        Modules.get().add(new VaultEnhanceModule());
 
         // Meteor 在所有 addon 的 onInitialize() 后会调用 Modules.get().sortModules()
         // 按 title 字母序强制重排，覆盖 add() 顺序。中文名按 Unicode 码点排序，
@@ -47,7 +53,10 @@ public class QueueNoticeAddon extends MeteorAddon {
                     "队列提醒",
                     "图腾提醒",
                     "玩家预警",
-                    "飞书Webhook",
+                    "自动指令",
+                    "自动开关",
+                    "宝库增强",
+                    "全局设置",
                     "数据包调试"
             );
 
