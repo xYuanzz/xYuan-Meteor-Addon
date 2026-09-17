@@ -1,23 +1,21 @@
 package cn.anyho.xyuan.blockesp;
 
+import cn.anyho.xyuan.compat.StateFilterDataMeteorBinding;
+import cn.anyho.xyuan.compat.Via;
 import meteordevelopment.meteorclient.gui.GuiTheme;
 import meteordevelopment.meteorclient.gui.WidgetScreen;
 import meteordevelopment.meteorclient.settings.BlockDataSetting;
 import meteordevelopment.meteorclient.settings.GenericSetting;
 import meteordevelopment.meteorclient.settings.IBlockData;
-import meteordevelopment.meteorclient.settings.IGeneric;
 import meteordevelopment.meteorclient.utils.misc.IChangeable;
 import net.minecraft.block.Block;
 import net.minecraft.nbt.NbtCompound;
-import net.minecraft.nbt.NbtElement;
-import net.minecraft.nbt.NbtList;
-import net.minecraft.nbt.NbtString;
 
 import java.util.ArrayList;
 import java.util.List;
 
 /** BlockESP 单方块状态过滤数据，序列化方式对齐原版 ESPBlockData。 */
-public class StateFilterData implements IGeneric<StateFilterData>, IChangeable, IBlockData<StateFilterData> {
+public class StateFilterData implements StateFilterDataMeteorBinding, IChangeable, IBlockData<StateFilterData> {
     public boolean enabled;
     public FilterMode mode;
     public RuleLogic ruleLogic;
@@ -78,9 +76,7 @@ public class StateFilterData implements IGeneric<StateFilterData>, IChangeable, 
         tag.putString("mode", mode.name());
         tag.putString("ruleLogic", ruleLogic.name());
 
-        NbtList rulesTag = new NbtList();
-        for (String rule : rules) rulesTag.add(NbtString.of(rule));
-        tag.put("rules", rulesTag);
+        Via.writeStringList(tag, "rules", rules);
 
         tag.putBoolean("changed", changed);
 
@@ -89,16 +85,14 @@ public class StateFilterData implements IGeneric<StateFilterData>, IChangeable, 
 
     @Override
     public StateFilterData fromTag(NbtCompound tag) {
-        enabled = tag.getBoolean("enabled", false);
-        mode = FilterMode.valueOf(tag.getString("mode", "Whitelist"));
-        ruleLogic = RuleLogic.valueOf(tag.getString("ruleLogic", "MatchAny"));
+        enabled = Via.readBoolean(tag, "enabled", false);
+        mode = FilterMode.valueOf(Via.readString(tag, "mode", "Whitelist"));
+        ruleLogic = RuleLogic.valueOf(Via.readString(tag, "ruleLogic", "MatchAny"));
 
         rules.clear();
-        for (NbtElement element : tag.getListOrEmpty("rules")) {
-            element.asString().ifPresent(rules::add);
-        }
+        rules.addAll(Via.readStringList(tag, "rules"));
 
-        changed = tag.getBoolean("changed", false);
+        changed = Via.readBoolean(tag, "changed", false);
 
         return this;
     }

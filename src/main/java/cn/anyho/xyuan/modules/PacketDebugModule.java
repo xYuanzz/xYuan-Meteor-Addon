@@ -21,8 +21,12 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 数据包调试模块：抓取接收（S2C）与发送（C2S）数据包，写入日志文件供分析。
@@ -191,12 +195,37 @@ public class PacketDebugModule extends Module {
 
     // ---------- 运行时状态 ----------
 
-    /** 单线程守护线程池：所有文件 I/O 在此执行，主线程零阻塞。 */
-    private final ExecutorService writerThread = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "PacketDebug-Writer");
-        t.setDaemon(true);
-        return t;
-    });
+    /**
+     * 后台写入队列容量。
+     *
+     * <p>必须是<b>有界</b>的：{@code Executors.newSingleThreadExecutor()} 内部用的是容量为
+     * {@code Integer.MAX_VALUE} 的 LinkedBlockingQueue。采集速度一旦超过磁盘写入速度
+     * （进服 / 切维度时的区块数据包尤其容易触发），队列会无上限增长直到 OOM。</p>
+     */
+    private static final int WRITE_QUEUE_CAPACITY = 8192;
+
+    /** 过载日志的节流间隔，避免刷屏又不掩盖「记录不全」这件事。 */
+    private static final long OVERLOAD_LOG_INTERVAL_MS = 5000L;
+
+    /** 因队列满而丢弃的行数（暴露为模块信息栏的数字，如实反映采集是否完整）。 */
+    private final AtomicLong droppedLines = new AtomicLong();
+
+    /** 过载日志上次输出的时间戳。 */
+    private final AtomicLong lastOverloadLogMs = new AtomicLong();
+
+    /** 有界阻塞队列。声明必须早于 writerThread，保证字段初始化顺序正确。 */
+    private final BlockingQueue<Runnable> writeQueue = new ArrayBlockingQueue<>(WRITE_QUEUE_CAPACITY);
+
+    /** 单线程守护线程池 + 有界队列：所有文件 I/O 在此执行，主线程零阻塞；队列满则丢弃并计数。 */
+    private final ExecutorService writerThread = new ThreadPoolExecutor(
+            1, 1, 0L, TimeUnit.MILLISECONDS, writeQueue,
+            r -> {
+                Thread t = new Thread(r, "PacketDebug-Writer");
+                t.setDaemon(true);
+                return t;
+            },
+            (task, executor) -> droppedLines.incrementAndGet()
+    );
 
     /** 文件写入器，仅在后台线程中访问，无需同步。 */
     private volatile BufferedWriter writer;
@@ -207,12 +236,16 @@ public class PacketDebugModule extends Module {
 
     @Override
     public void onActivate() {
-        writer = null;
         String filePath = logFile.get();
         boolean truncate = clearOnActivate.get();
 
-        // 在后台线程打开文件，避免主线程阻塞
+        // 打开与关闭全部在后台线程串行执行，主线程不参与 writer 的赋值。
+        // 这样 writer 只有一个写入者（后台线程），不存在「主线程先置 null，导致关闭任务判空跳过」的竞态。
         writerThread.submit(() -> {
+            // 防御：万一还有上一次未关闭的实例，先关掉
+            closeWriter(writer);
+            writer = null;
+
             try {
                 Path path = Paths.get(filePath);
                 Path parent = path.getParent();
@@ -222,11 +255,12 @@ public class PacketDebugModule extends Module {
                 StandardOpenOption openOption = truncate
                         ? StandardOpenOption.TRUNCATE_EXISTING
                         : StandardOpenOption.APPEND;
-                writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8,
+                BufferedWriter opened = Files.newBufferedWriter(path, StandardCharsets.UTF_8,
                         StandardOpenOption.CREATE, openOption);
-                writer.write("=== xYuan's Mod 数据包调试启动 === " + LocalDateTime.now().format(TIME_FORMAT));
-                writer.newLine();
-                writer.flush();
+                opened.write("=== xYuan's Mod 数据包调试启动 === " + LocalDateTime.now().format(TIME_FORMAT));
+                opened.newLine();
+                opened.flush();
+                writer = opened;
             } catch (IOException e) {
                 QueueNoticeAddon.LOG.error("[xYuan's Mod] PacketDebug open file failed: {}", e.toString());
             }
@@ -235,20 +269,27 @@ public class PacketDebugModule extends Module {
 
     @Override
     public void onDeactivate() {
-        // 在后台线程关闭 writer，确保所有缓冲数据落盘
-        writerThread.submit(() -> {
-            if (writer != null) {
-                try {
-                    writer.write("=== 数据包调试停止 === " + LocalDateTime.now().format(TIME_FORMAT));
-                    writer.newLine();
-                    writer.flush();
-                    writer.close();
-                } catch (IOException e) {
-                    QueueNoticeAddon.LOG.error("[xYuan's Mod] PacketDebug close file failed: {}", e.toString());
-                }
-                writer = null;
-            }
-        });
+        // 关键：先捕获当前 writer 再置空，让关闭任务操作自己捕获到的实例。
+        // 若像原来那样在任务里读 writer 字段并判空，而此时主线程已把它置成 null，
+        // 关闭任务就会直接跳过 —— 旧文件句柄泄漏，且缓冲区里未落盘的数据丢失。
+        BufferedWriter closing = writer;
+        writer = null;
+        writerThread.submit(() -> closeWriter(closing));
+    }
+
+    /** 后台线程调用：写入结束标记并关闭。只操作传入实例，与 writer 字段无关，因此可安全重复调用。 */
+    private void closeWriter(BufferedWriter target) {
+        if (target == null) {
+            return;
+        }
+        try {
+            target.write("=== 数据包调试停止 === " + LocalDateTime.now().format(TIME_FORMAT));
+            target.newLine();
+            target.flush();
+            target.close();
+        } catch (IOException e) {
+            QueueNoticeAddon.LOG.error("[xYuan's Mod] PacketDebug close file failed: {}", e.toString());
+        }
     }
 
     // ---------- 事件监听 ----------
@@ -273,12 +314,24 @@ public class PacketDebugModule extends Module {
             return;
         }
 
-        // 在主线程立即调用 toString()，避免 Netty buffer 被回收后失效
+        // 队列已满说明采集已经跟不上写入。此时不再做昂贵的 toString()：
+        // 大包（区块数据、注册表同步等）的 toString() 会瞬时分配大量内存，
+        // 既然这一行注定被丢弃，就没必要让主线程为它付出分配与 GC 的代价。
+        boolean overloaded = writeQueue.remainingCapacity() == 0;
+        if (overloaded) {
+            reportOverload();
+        }
+
         String packetStr;
-        try {
-            packetStr = packet.toString();
-        } catch (Throwable t) {
-            packetStr = "[toString() failed: " + t + "]";
+        if (overloaded) {
+            packetStr = "(写入队列已满，本行内容已省略)";
+        } else {
+            // 必须在主线程立即调用 toString()，避免 Netty buffer 被回收后失效
+            try {
+                packetStr = packet.toString();
+            } catch (Throwable t) {
+                packetStr = "[toString() failed: " + t + "]";
+            }
         }
 
         String className = packet.getClass().getSimpleName();
@@ -286,8 +339,29 @@ public class PacketDebugModule extends Module {
         String time = LocalDateTime.now().format(TIME_FORMAT);
         String line = formatLine(time, direction, state, className, packetStr);
 
-        // 提交后台线程写文件，主线程零阻塞
+        // 提交后台线程写文件，主线程零阻塞；队列满时由拒绝策略计数并丢弃
         writerThread.submit(() -> appendToFile(line));
+    }
+
+    /** 过载时按 {@link #OVERLOAD_LOG_INTERVAL_MS} 节流输出日志，如实告知「记录已不完整」。 */
+    private void reportOverload() {
+        long now = System.currentTimeMillis();
+        long last = lastOverloadLogMs.get();
+        if (now - last < OVERLOAD_LOG_INTERVAL_MS) {
+            return;
+        }
+        if (lastOverloadLogMs.compareAndSet(last, now)) {
+            QueueNoticeAddon.LOG.warn(
+                    "[xYuan's Mod] PacketDebug 写入队列已满，累计丢弃 {} 行；请缩小过滤范围或改用「分类过滤」模式。",
+                    droppedLines.get());
+        }
+    }
+
+    /** 模块信息栏：显示累计丢弃行数，为 0 时不显示。 */
+    @Override
+    public String getInfoString() {
+        long dropped = droppedLines.get();
+        return dropped == 0 ? null : ("丢弃 " + dropped);
     }
 
     /** 判断是否应抓取此数据包（按模式 + 方向 + 状态 + 类名关键字组合过滤）。 */

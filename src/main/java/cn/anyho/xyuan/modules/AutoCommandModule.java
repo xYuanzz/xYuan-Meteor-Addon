@@ -1,6 +1,7 @@
 package cn.anyho.xyuan.modules;
 
 import cn.anyho.xyuan.QueueNoticeAddon;
+import cn.anyho.xyuan.compat.Via;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.BoolSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
@@ -12,7 +13,6 @@ import meteordevelopment.meteorclient.utils.player.PlayerUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
-import net.minecraft.network.packet.c2s.play.CommandExecutionC2SPacket;
 
 /**
  * 自动指令模块：监控生命值、不死图腾数量与 Y 轴坐标，低于阈值时自动在聊天栏发送指定指令。
@@ -30,7 +30,7 @@ import net.minecraft.network.packet.c2s.play.CommandExecutionC2SPacket;
  * 同时每次触发受「触发冷却」最小间隔限制，防止数值在阈值附近抖动导致连发。
  * 死亡期间（生命值为 0）暂停全部检查， respawn 后随生命值恢复自动重新武装。</p>
  *
- * <p>指令发送机制参考 LeavesHack AutoLogin：直接发送 {@link CommandExecutionC2SPacket}
+ * <p>指令发送机制参考 LeavesHack AutoLogin：直接发送命令执行包（走 {@code Via#sendCommand} 兼容层）
  * （内容不含 "/" 前缀；配置时写不写 "/" 均可，发送前自动剔除）。</p>
  */
 public class AutoCommandModule extends Module {
@@ -259,7 +259,7 @@ public class AutoCommandModule extends Module {
     /**
      * 发送指令到聊天栏（参考 LeavesHack AutoLogin 的命令发送机制）。
      *
-     * <p>自动剔除前导 "/" 与空白后发送 {@link CommandExecutionC2SPacket}；
+     * <p>自动剔除前导 "/" 与空白后交由兼容层的 {@code Via.sendCommand} 发包；
      * 指令为空时仅警告不发送（不误触发裸包）。</p>
      *
      * @param rawCommand 用户配置的原始指令
@@ -271,10 +271,10 @@ public class AutoCommandModule extends Module {
             warning("触发自动指令（" + reason + "），但未配置对应指令，已跳过发送。");
             return;
         }
-        if (mc.getNetworkHandler() == null) {
+        if (!Via.sendCommand(command)) {
+            // 网络未就绪时静默跳过：保持与引入兼容层之前一致的行为，不额外产生聊天栏提示
             return;
         }
-        mc.getNetworkHandler().sendPacket(new CommandExecutionC2SPacket(command));
         info("已发送指令 /" + command + "（" + reason + "）");
     }
 

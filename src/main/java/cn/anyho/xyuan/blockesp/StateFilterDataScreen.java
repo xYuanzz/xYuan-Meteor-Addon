@@ -6,7 +6,6 @@ import meteordevelopment.meteorclient.settings.BlockDataSetting;
 import meteordevelopment.meteorclient.settings.BoolSetting;
 import meteordevelopment.meteorclient.settings.EnumSetting;
 import meteordevelopment.meteorclient.settings.GenericSetting;
-import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.settings.Settings;
 import meteordevelopment.meteorclient.settings.StringListSetting;
@@ -18,22 +17,44 @@ import java.util.ArrayList;
 /** BlockESP 单方块状态过滤配置界面，结构与原版 ESPBlockDataScreen 一致。 */
 public class StateFilterDataScreen extends WindowScreen {
     private final StateFilterData filterData;
-    private final Setting<?> setting;
+
+    /**
+     * 数据变更时通知宿主的回调（通常是 {@code Setting::onChanged}）。
+     *
+     * <p>界面本身并不需要 Setting 这个对象，只需要「变更了，通知一下」这个动作，
+     * 因此依赖的是一个 Runnable 而不是 Setting。没有宿主的构造路径传 null，
+     * 也就不存在「可空的 Setting 被误用」这种中间状态。</p>
+     */
+    private final @Nullable Runnable changeNotifier;
+
     private final @Nullable Runnable firstChangeConsumer;
 
     public StateFilterDataScreen(GuiTheme theme, StateFilterData filterData, Block block, BlockDataSetting<StateFilterData> setting) {
-        this(theme, filterData, setting, () -> setting.get().put(block, filterData));
+        this(theme, filterData, setting::onChanged, () -> setting.get().put(block, filterData));
     }
 
     public StateFilterDataScreen(GuiTheme theme, StateFilterData filterData, GenericSetting<StateFilterData> setting) {
-        this(theme, filterData, setting, null);
+        this(theme, filterData, setting::onChanged, null);
     }
 
-    private StateFilterDataScreen(GuiTheme theme, StateFilterData filterData, Setting<?> setting, @Nullable Runnable firstChangeConsumer) {
+    /**
+     * 无宿主构造器。
+     *
+     * <p>供低版本（1.21.1 / 1.21.4）的 {@code IScreenFactory#createScreen(GuiTheme)} 使用：
+     * 该路径没有可回写的设置项，只展示与编辑数据本身，因此变更通知为空。</p>
+     */
+    public StateFilterDataScreen(GuiTheme theme, StateFilterData filterData) {
+        // 必须显式转型：4 参构造器还有一个 (GuiTheme, StateFilterData, Block, BlockDataSetting)，
+        // 直接传 null, null 会与它构成重载歧义
+        this(theme, filterData, (Runnable) null, null);
+    }
+
+    private StateFilterDataScreen(GuiTheme theme, StateFilterData filterData,
+                                  @Nullable Runnable changeNotifier, @Nullable Runnable firstChangeConsumer) {
         super(theme, "配置状态过滤");
 
         this.filterData = filterData;
-        this.setting = setting;
+        this.changeNotifier = changeNotifier;
         this.firstChangeConsumer = firstChangeConsumer;
     }
 
@@ -108,7 +129,9 @@ public class StateFilterDataScreen extends WindowScreen {
             firstChangeConsumer.run();
         }
 
-        setting.onChanged();
+        if (changeNotifier != null) {
+            changeNotifier.run();
+        }
         filterData.changed();
     }
 }

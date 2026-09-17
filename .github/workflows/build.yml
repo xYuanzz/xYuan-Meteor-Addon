@@ -1,20 +1,65 @@
-name: Release Build
+name: Build & Release
 
+# 触发条件说明：
+#   release[published] —— 「发布新版本」时触发。注意用 published 而不是 created：
+#                        草稿（draft）状态的 release 不会触发 created，只有正式发布才会。
+#   workflow_dispatch  —— 手动触发，用于在不发版的情况下验证三版本构建是否健康。
 on:
   release:
-    types: [created]
+    types: [published]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  release:
-    name: Attach JAR to Release
+  # ---------------------------------------------------------------------------
+  # 从 versions/ 目录动态发现要构建的 Minecraft 版本，供构建矩阵使用。
+  # 好处：将来新增一个 versions/<mc>.properties 就会自动多出一个矩阵条目，
+  #       不需要再来改这个 workflow；版本列表的「单一事实来源」始终是 versions/。
+  # ---------------------------------------------------------------------------
+  discover:
+    name: Discover MC versions
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    outputs:
+      list: ${{ steps.scan.outputs.list }}
+      count: ${{ steps.scan.outputs.count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      - name: Scan versions/
+        id: scan
+        run: |
+          set -euo pipefail
+          versions=$(find versions -maxdepth 1 -type f -name '*.properties' -printf '%f\n' \
+            | sed 's/\.properties$//' | sort -V | paste -sd, -)
+          if [ -z "$versions" ]; then
+            echo "::error::versions/ 目录下没有找到任何 .properties 版本文件"
+            exit 1
+          fi
+          count=$(printf '%s' "$versions" | awk -F, '{print NF}')
+          json=$(printf '%s' "$versions" | sed 's/,/","/g')
+          {
+            echo "list=[\"$json\"]"
+            echo "count=$count"
+          } >> "$GITHUB_OUTPUT"
+          echo "发现 $count 个版本：$versions"
+
+  # ---------------------------------------------------------------------------
+  # 构建矩阵：每个 MC 版本一个并行 job。
+  # 这里逐个调用 `build -Pminecraft_version=...` 而不是 `buildAll`：
+  # 矩阵本身已经提供了并行与隔离，不需要再在单个 job 里串行跑三遍嵌套构建。
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build MC ${{ matrix.minecraft_version }}
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        minecraft_version: ${{ fromJSON(needs.discover.outputs.list) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,25 +73,81 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Generate Gradle Wrapper
-        run: gradle wrapper --gradle-version 9.2.0 --distribution-type bin
+      # gradle wrapper（gradlew / gradlew.bat / gradle/wrapper）已提交进仓库，
+      # 不再在 CI 里临时生成，保证本地与 CI 使用同一套可复现的构建环境。
+      - name: Show version coordinates
+        run: ./gradlew printVersions -Pminecraft_version=${{ matrix.minecraft_version }} --console=plain
 
-      - name: Build with Gradle
-        run: ./gradlew build --no-daemon --stacktrace
+      - name: Build
+        run: ./gradlew build -Pminecraft_version=${{ matrix.minecraft_version }} --console=plain --stacktrace
 
-      - name: Resolve JAR path
-        id: jar
+      # 产物命名约定：xyuan-mod-<minecraft_version>-<mod_version>.jar
+      # 由 build.gradle.kts 的 archivesName 保证，这里显式断言一次，
+      # 避免以后改 archivesName 时产物名与矩阵对不上却在 release 里静默混过去。
+      - name: Verify artifact naming
+        env:
+          MC: ${{ matrix.minecraft_version }}
         run: |
-          jar_path=$(find build/libs -maxdepth 1 -type f -name "*.jar" ! -name "*-sources.jar" ! -name "*-dev.jar" | head -n 1)
-          if [ -z "$jar_path" ]; then
-            echo "::error::No release JAR found in build/libs"
+          set -euo pipefail
+          jars=$(find build/libs -maxdepth 1 -type f -name '*.jar' \
+            ! -name '*-dev.jar' ! -name '*-sources.jar' | sort)
+          if [ -z "$jars" ]; then
+            echo "::error::MC $MC 没有产出 jar"
             exit 1
           fi
-          echo "path=$jar_path" >> "$GITHUB_OUTPUT"
-          echo "name=$(basename "$jar_path")" >> "$GITHUB_OUTPUT"
+          echo "$jars"
+          for jar in $jars; do
+            name=$(basename "$jar")
+            case "$name" in
+              xyuan-mod-"$MC"-*.jar) echo "命名符合约定: $name" ;;
+              *) echo "::error::产物命名不符合约定 xyuan-mod-$MC-<mod_version>.jar，实际为 $name"; exit 1 ;;
+            esac
+          done
 
-      - name: Attach JAR to GitHub Release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xyuan-mod-${{ matrix.minecraft_version }}
+          path: |
+            build/libs/*.jar
+            !build/libs/*-dev.jar
+            !build/libs/*-sources.jar
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 汇总所有 jar 并挂到 Release 上（只在 release 触发时执行）。
+  # ---------------------------------------------------------------------------
+  release:
+    name: Attach JARs to Release
+    needs: [discover, build]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify jar count
+        env:
+          EXPECTED: ${{ needs.discover.outputs.count }}
+        run: |
+          set -euo pipefail
+          jars=$(find dist -maxdepth 1 -type f -name '*.jar' | sort)
+          actual=$(printf '%s\n' $jars | sed '/^$/d' | wc -l)
+          printf '收集到 %s 个 jar（期望 %s 个）：\n' "$actual" "$EXPECTED"
+          printf '  %s\n' $jars
+          if [ "$actual" -ne "$EXPECTED" ]; then
+            echo "::error::jar 数量与版本数量不一致（期望 $EXPECTED，实际 $actual）"
+            exit 1
+          fi
+
+      - name: Attach JARs to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.jar.outputs.path }}
+          files: dist/*.jar
           fail_on_unmatched_files: true

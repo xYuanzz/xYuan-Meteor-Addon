@@ -3,6 +3,7 @@ package cn.anyho.xyuan.modules;
 import cn.anyho.xyuan.QueueNoticeAddon;
 import cn.anyho.xyuan.blockesp.BlockStateFilters;
 import cn.anyho.xyuan.blockesp.IRefreshableBlockESP;
+import cn.anyho.xyuan.compat.Via;
 import cn.anyho.xyuan.vault.VaultRecord;
 import cn.anyho.xyuan.vault.VaultRecordStore;
 import meteordevelopment.meteorclient.events.entity.player.InteractBlockEvent;
@@ -26,7 +27,6 @@ import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 
-import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -82,6 +82,7 @@ public class VaultEnhanceModule extends Module {
 
     @Override
     public void onActivate() {
+        contextCheckCountdown = 0;
         reloadForCurrentContext(true);
     }
 
@@ -89,11 +90,15 @@ public class VaultEnhanceModule extends Module {
     public void onDeactivate() {
         pendingInteracts.clear();
         BlockStateFilters.setOpenedPositions(null);
+        // 把落盘防抖窗口内尚未写入的解锁记录立即刷盘
+        VaultRecordStore.get().flush();
     }
 
     @EventHandler
     private void onGameLeft(GameLeftEvent event) {
         pendingInteracts.clear();
+        // 离开服务器时立即落盘，避免防抖窗口内的记录随会话结束而丢失
+        VaultRecordStore.get().flush();
     }
 
     /** 本地玩家右键方块：若目标是宝库，记入待确认。 */
@@ -120,7 +125,7 @@ public class VaultEnhanceModule extends Module {
     private void onPlaySound(PlaySoundPacketEvent event) {
         if (mc.world == null || mc.player == null) return;
         PlaySoundS2CPacket packet = event.packet;
-        if (!packet.getSound().matchesId(SoundEvents.BLOCK_VAULT_INSERT_ITEM.id())) return;
+        if (!packet.getSound().matchesId(Via.soundEventId(SoundEvents.BLOCK_VAULT_INSERT_ITEM))) return;
 
         double sx = packet.getX();
         double sy = packet.getY();
@@ -150,19 +155,35 @@ public class VaultEnhanceModule extends Module {
         recordUnlock(BlockPos.fromLong(bestKey));
     }
 
+    /**
+     * 服务器/维度变化检测的间隔（tick）。
+     * 这两个值不需要 20Hz 的检测精度，降低频率可以省下每 tick 的字符串拼接与地址清洗开销；
+     * 待确认右键的超时清理也顺带按这个周期执行（判定本身仍按时间窗口，不受影响）。
+     */
+    private static final int CONTEXT_CHECK_INTERVAL_TICKS = 10;
+
+    /** 倒数到 0 时执行一次服务器/维度检测。 */
+    private int contextCheckCountdown;
+
     /** 每 tick 检测服务器/维度变化，变化时重新加载对应记录；顺带清理超时待确认项。 */
     @EventHandler
     private void onTick(TickEvent.Post event) {
         if (mc.world == null) return;
+
+        if (--contextCheckCountdown > 0) {
+            return;
+        }
+        contextCheckCountdown = CONTEXT_CHECK_INTERVAL_TICKS;
 
         long now = System.currentTimeMillis();
         long window = detectWindowMs.get();
         pendingInteracts.entrySet().removeIf(e -> now - e.getValue() > window);
 
         String serverKey = VaultRecordStore.computeServerKey(mc);
+        // getValue().toString() 不可能返回 null，无需判空
         String dimension = mc.world.getRegistryKey().getValue().toString();
 
-        if (!serverKey.equals(loadedServerKey) || dimension == null || !dimension.equals(lastDimension)) {
+        if (!serverKey.equals(loadedServerKey) || !dimension.equals(lastDimension)) {
             reloadForCurrentContext(false);
         }
     }
@@ -227,7 +248,9 @@ public class VaultEnhanceModule extends Module {
         }
         String dimension = mc.world.getRegistryKey().getValue().toString();
         Set<Long> keys = VaultRecordStore.get().getOpenedPositionKeys(currentWorldLabel.get(), dimension);
-        BlockStateFilters.setOpenedPositions(new HashSet<>(keys));
+        // getOpenedPositionKeys 已返回新建集合；setOpenedPositions 内部会再做一次防御性拷贝，
+        // 这里无需重复复制
+        BlockStateFilters.setOpenedPositions(keys);
     }
 
     /** 触发 BlockESP 重新扫描以反映 rewarded 过滤。 */

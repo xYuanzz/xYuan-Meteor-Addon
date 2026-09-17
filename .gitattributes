@@ -1,0 +1,4 @@
+# gradle wrapper 的 shell 脚本必须保持 LF，
+# 否则在 Linux / CI 上执行会因 shebang 或行尾的 \r 而失败。
+gradlew text eol=lf
+*.bat text eol=crlf

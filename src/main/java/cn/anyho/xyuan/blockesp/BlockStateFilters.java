@@ -6,6 +6,7 @@ import net.minecraft.util.math.BlockPos;
 
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
@@ -50,8 +51,18 @@ public final class BlockStateFilters {
         filters = compiled.isEmpty() ? Collections.emptyMap() : Collections.unmodifiableMap(compiled);
     }
 
-    /** 更新已开宝库坐标集合（由宝库增强模块在解锁/切换世界维度时调用）。 */
+    /**
+     * 更新已开宝库坐标集合（由宝库增强模块在解锁/切换世界维度时调用）。
+     *
+     * <p>这里做一次防御性拷贝再发布：{@code Collections.unmodifiableSet} 只是包装，
+     * 若直接包住调用方传入的集合、而调用方事后原地修改它，扫描线程读到的就不再是不可变快照，
+     * volatile 发布的可见性保证会被打破。拷贝后封装，快照才真正不可变。</p>
+     */
     public static void setOpenedPositions(Set<Long> positions) {
-        openedPositions = positions == null || positions.isEmpty() ? Collections.emptySet() : Collections.unmodifiableSet(positions);
+        if (positions == null || positions.isEmpty()) {
+            openedPositions = Collections.emptySet();
+        } else {
+            openedPositions = Collections.unmodifiableSet(new HashSet<>(positions));
+        }
     }
 }
